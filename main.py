@@ -3,14 +3,55 @@
 ===================================
 A股自选股智能分析系统 - 主调度程序
 ===================================
-【智能分水岭版】15点前锁定上个交易日，15点后锁定当天收盘，完美兼容全时段动态抓取
+【智能分水岭原生版 + 全局底层网络熔断】彻底根治 GitHub Actions 30分钟超时卡死问题
 """
 from __future__ import annotations
 
 import os
+import sys
+import socket
+
+# 🛡️ 核心防护 1：设置全局底层 Socket 默认超时，防止任何原生网络连接无限期死等
+socket.setdefaulttimeout(10.0)
+
+# 🛡️ 核心防护 2：利用猴子补丁（Monkey Patch）强制约束 requests 和 urllib3 的默认超时
+# 许多第三方金融库（如 AkShare 内部调用的接口）如果没有显式传 timeout，会用 urllib3 的默认值（即无限等待）
+try:
+    import urllib3
+    from urllib3.util import Timeout
+    # 强制将 urllib3 的默认连接和读取超时限制在 10 秒以内
+    urllib3.util.timeout.Timeout.DEFAULT_TIMEOUT = 10.0
+    
+    # 针对新版 requests 底层的 HTTPAdapter 进行全局默认超时拦截
+    import requests
+    from requests.adapters import HTTPAdapter
+    class TimeoutHTTPAdapter(HTTPAdapter):
+        def __init__(self, *args, **kwargs):
+            self.timeout = 10.0
+            if "timeout" in kwargs:
+                self.timeout = kwargs["timeout"]
+                del kwargs["timeout"]
+            super().__init__(*args, **kwargs)
+        def send(self, request, **kwargs):
+            timeout = kwargs.get("timeout")
+            if timeout is None:
+                kwargs["timeout"] = self.timeout
+            return super().send(request, **kwargs)
+            
+    # 全局复写 requests 的 session 行为
+    old_session = requests.Session
+    class DefaultTimeoutSession(old_session):
+        def __init__(self):
+            super().__init__()
+            adapter = TimeoutHTTPAdapter(timeout=10.0)
+            self.mount("http://", adapter)
+            self.mount("https://", adapter)
+    requests.Session = DefaultTimeoutSession
+except Exception:
+    pass
+
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
 from dotenv import dotenv_values
 from src.config import setup_env
 
@@ -27,8 +68,6 @@ if os.getenv("GITHUB_ACTIONS") != "true" and os.getenv("USE_PROXY", "false").low
 
 import argparse
 import logging
-import sys
-import time
 import uuid
 import akshare as ak
 from datetime import datetime, timezone, timedelta
@@ -45,33 +84,32 @@ _RUNTIME_ENV_FILE_KEYS = set()
 # ====================== 🎯 核心逻辑：智能时间判断分水岭（原生平替版） ======================
 def get_last_trading_day_stocks() -> list:
     """
-    自适应 A 股收盘逻辑（无需 pandas_market_calendars 依赖）：
-    - 智能过滤周末，15点前自动回溯到上一个有效的交易日
+    自适应 A 股收盘逻辑（免外部日历依赖版）：
+    - 若当前未收盘（15点前）或今天非交易日：严格获取【上一个收盘交易日】
+    - 若当前已收盘（15点后）且今天是交易日：严格获取【今天】
     """
     try:
         now = datetime.now()
         
-        # 1. 基础时间推算：15点前看前一天，15点后看今天
+        # 基础时间分水岭推算：15点前看前一天，15点后看今天
         if now.hour < 15:
             target_dt = now - timedelta(days=1)
         else:
             target_dt = now
 
-        # 2. 智能跳过周末（如果落在了周六或周日，自动向前寻找周五）
         # weekday(): 0=周一, ..., 5=周六, 6=周日
-        if target_dt.weekday() == 5:    # 如果是周六
-            target_dt = target_dt - timedelta(days=1)  # 退回周五
-        elif target_dt.weekday() == 6:  # 如果是周日
-            target_dt = target_dt - timedelta(days=2)  # 退回周五
+        if target_dt.weekday() == 5:    # 周六退回周五
+            target_dt = target_dt - timedelta(days=1)
+        elif target_dt.weekday() == 6:  # 周日退回周五
+            target_dt = target_dt - timedelta(days=2)
 
         raw_date = target_dt.strftime("%Y-%m-%d")
         
         if now.hour >= 15 and now.weekday() < 5:
             logger.info(f"⏰ 当前时间 {now.strftime('%H:%M')} 已收盘，目标锁定【今日收盘交易日】：{raw_date}")
         else:
-            logger.info(f"⏰ 当前未收盘或处于非交易日，目标锁定【历史交易日】：{raw_date}")
+            logger.info(f"⏰ 当前未收盘或处于周末，目标锁定【历史交易日】：{raw_date}")
 
-        # 去除横杠适配 AkShare 格式 (如 20260515)
         target_date = raw_date.replace("-", "").strip()
         logger.info(f"📅 策略最终向 AkShare 发起请求的目标日期：【{target_date}】")
 
@@ -79,8 +117,7 @@ def get_last_trading_day_stocks() -> list:
         try:
             df = ak.stock_zt_pool_em(date=target_date)
         except (ValueError, Exception) as e:
-            # 温柔挂起，不让 Actions 崩溃变红
-            logger.warning(f"⚠️ 调取接口时遭遇结构波动（东财服务器可能正在维护/清空 {target_date} 的数据）: {str(e)[:100]}")
+            logger.warning(f"⚠️ 调取接口时遭遇结构波动（东财服务器可能正在维护或跨境网络超时）: {str(e)[:100]}")
             return []
 
         # 解析清洗代码
@@ -91,12 +128,11 @@ def get_last_trading_day_stocks() -> list:
                 for c in df[code_col].tolist():
                     c_str = str(c).strip()
                     if c_str and len(c_str) == 6 and c_str.isdigit():
-                        # ✨ 核心过滤修改：只保留主板(60, 00)和创业板(30)
-                        # 自动排除 688(科创板)、83/87/43(北交所)
+                        # 只允许主板(60, 00)和创业板(30)
                         if c_str.startswith(('60', '00', '30')):
                             stock_list.append(c_str)
                 
-                logger.info(f"✅ 成功提取并过滤 A 股主板/创业板【{target_date}】真实涨停个股共 {len(stock_list)} 只！")
+                logger.info(f"✅ 成功提取并清洗 A 股主板/创业板【{target_date}】真实涨停个股共 {len(stock_list)} 只！")
                 return stock_list
 
         logger.warning(f"⚠️ 接口响应成功，但【{target_date}】并未返回任何符合板块要求的涨停股票。")
@@ -243,8 +279,32 @@ def parse_arguments() -> argparse.Namespace:
 def _compute_trading_day_filter(
     config: Config, args: argparse.Namespace, stock_codes: List[str]
 ) -> Tuple[List[str], Optional[str], bool]:
-    # 彻底移除不可靠的外部日历过滤拦截机制，改为由主流水线内部控制
-    return (stock_codes, None, False)
+    force_run = getattr(args, 'force_run', False)
+    if force_run or not getattr(config, 'trading_day_check_enabled', True):
+        return (stock_codes, None, False)
+        
+    try:
+        from src.core.trading_calendar import (
+            get_market_for_stock, get_open_markets_today, compute_effective_region
+        )
+        open_markets = get_open_markets_today()
+        filtered_codes = []
+        for code in stock_codes:
+            mkt = get_market_for_stock(code)
+            if mkt in open_markets or mkt is None:
+                filtered_codes.append(code)
+                
+        if config.market_review_enabled and not getattr(args, 'no_market_review', False):
+            effective_region = compute_effective_region(
+                getattr(config, 'market_review_region', 'cn') or 'cn', open_markets
+            )
+        else:
+            effective_region = None
+        should_skip_all = (not filtered_codes) and (effective_region or '') == ''
+        return (filtered_codes, effective_region, should_skip_all)
+    except Exception as e:
+        logger.warning(f"⚠️ 交易日历拦截模块网络波动，已自动切换为全面放行模式: {e}")
+        return (stock_codes, "cn", False)
 
 def _run_market_review_with_shared_lock(
     config: Config, run_market_review_func: Callable[..., Optional[str]], **kwargs: Any
@@ -317,8 +377,12 @@ def run_full_analysis(
         if getattr(args, 'no_context_snapshot', False):
             save_context_snapshot = False
         query_id = uuid.uuid4().hex
+        
+        # 🛡️ 优化点 3：降低并发度为 2。线程太多更容易触发国内财经网站的防海外抓取高频屏蔽锁。
+        workers = args.workers if args.workers is not None else 2
+        
         pipeline = StockAnalysisPipeline(
-            config=config, max_workers=args.workers, query_id=query_id,
+            config=config, max_workers=workers, query_id=query_id,
             query_source="cli", save_context_snapshot=save_context_snapshot
         )
 
