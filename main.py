@@ -23,6 +23,7 @@ A股自选股智能分析系统 - 主调度程序
 """
 from __future__ import annotations
 
+import akshare as ak
 import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -467,8 +468,58 @@ def run_full_analysis(
         if stock_codes is None:
             config.refresh_stock_list()
 
+        # =====================================================================
+        # 🔥 新增：动态拦截并获取“上个交易日”涨停股、所属板块及涨停原因
+        # =====================================================================
+        # 先取到要处理的初始代码列表
+        raw_codes = stock_codes if stock_codes is not None else config.stock_list
+        
+        # 判断配置或环境变量是否设置为了动态选股池 "ZT_POOL"
+        if len(raw_codes) == 1 and raw_codes[0].upper() == "ZT_POOL":
+            try:
+                logger.info("🚀 检测到 ZT_POOL 配置，正在从东方财富抓取上个交易日涨停股及板块原因...")
+                zt_df = ak.stock_zt_pool_em()
+                
+                if not zt_df.empty:
+                    # 获取实际的交易日期（例如：20260515）
+                    trade_date = str(zt_df['交易日'].iloc[0]) if '交易日' in zt_df.columns else "上个交易日"
+                    
+                    # 截取前 10 只股票（防止大模型超时或触发 API 频率限制限制）
+                    top_zt = zt_df.head(10)
+                    
+                    # 提取干净的股票代码列表（格式化为大写/规范代码）
+                    from data_provider.base import canonical_stock_code
+                    dynamic_codes = [canonical_stock_code(c) for c in top_zt['代码'].tolist()]
+                    
+                    # 覆盖当前的待分析股票列表
+                    effective_codes = dynamic_codes
+                    
+                    # 组装涨停内参背景，强行注入到环境变量中，后续大模型的 Prompt 可以直接读取它
+                    zt_context = f"\n【重点分析背景：以下为 {trade_date}（上个交易日）的实际涨停股数据】\n"
+                    for index, row in top_zt.iterrows():
+                        zt_context += (
+                            f"股票代码: {row['代码']}, 名称: {row['名称']}, "
+                            f"所属行业/板块: {row['所属行业']}, 涨停原因: {row['涨停原因']}, "
+                            f"连板天数: {row['连续涨停天数']}\n"
+                        )
+                    os.environ["ZT_CONTEXT"] = zt_context
+                    logger.info(f"✅ 成功加载 {trade_date} 涨停板内参数据，共 {len(dynamic_codes)} 只股票。")
+                else:
+                    logger.warning("⚠️ 未能从接口获取到任何涨停股数据，回退到空列表")
+                    effective_codes = []
+                    os.environ["ZT_CONTEXT"] = ""
+            except Exception as zt_err:
+                logger.error(f"❌ 动态获取上个交易日涨停数据失败: {zt_err}")
+                effective_codes = []
+                os.environ["ZT_CONTEXT"] = ""
+        else:
+            # 如果不是 ZT_POOL，则走原来的静态股票列表逻辑
+            effective_codes = raw_codes
+            os.environ["ZT_CONTEXT"] = ""
+        # =====================================================================
+
         # Issue #373: Trading day filter (per-stock, per-market)
-        effective_codes = stock_codes if stock_codes is not None else config.stock_list
+        # ⚠️ 注意：这里传入的参数改成了我们上面处理完的 effective_codes
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
             config, args, effective_codes
         )
