@@ -89,10 +89,10 @@ def get_last_trading_day_stocks() -> list:
                 stock_list.append(code)
 
         if stock_list:
-            logger.info(f"✅ 获取到【{target_date}】涨停股票 {len(stock_list)} 只")
+            logger.info(f"✅ 成功获取【{target_date}】涨停大池共 {len(stock_list)} 只股票")
             return stock_list
         else:
-            logger.warning(f"⚠️ {target_date} 无涨停股票，使用自选股")
+            logger.warning(f"⚠️ {target_date} 接口未返回涨停股票数据")
             return []
     except Exception as e:
         logger.error(f"❌ 获取涨停失败: {str(e)}")
@@ -288,15 +288,29 @@ def run_full_analysis(
         if stock_codes is None:
             config.refresh_stock_list()
 
-        # ====================== 核心调用 ======================
-        limit_up_stocks = get_last_trading_day_stocks()
-        if limit_up_stocks:
-            effective_codes = limit_up_stocks
-            logger.info(f"🚀 分析目标：上一交易日涨停 {len(effective_codes)} 只")
+        # ====================== 🚀 【核心优化部分】 ======================
+        # 优先拦截和处理环境配置：如果配置了 ZT_POOL 或者配置为空，强制走全自动涨停板逻辑
+        raw_stock_env = os.getenv("STOCK_LIST", "").strip().upper()
+        
+        if not raw_stock_env or raw_stock_env == "ZT_POOL":
+            logger.info("⚡ 检测到配置要求分析上个交易日涨停池，开始调用实时数据源...")
+            limit_up_stocks = get_last_trading_day_stocks()
+            if limit_up_stocks:
+                effective_codes = limit_up_stocks
+                logger.info(f"🚀 成功切入全自动模式：上一交易日涨停共 {len(effective_codes)} 只股票进入分析流")
+            else:
+                # 极端兜底情况：如果抓取接口挂了，则清空保证不输出 N/A 报错数据
+                effective_codes = []
+                logger.warning("⚠️ 未能抓取到有效的涨停数据，本次任务不产生无意义分析报告。")
         else:
+            # 如果配置的是普通的自选股代码（如 600519,000001），则走原项目的配置流
             effective_codes = config.stock_list
-            logger.info(f"📌 使用自选股：{len(effective_codes)} 只")
-        # ======================================================
+            logger.info(f"📌 正常解析自选股股票池：{len(effective_codes)} 只")
+        # ======================================================================
+
+        if not effective_codes:
+            logger.info("当前无有效股票代码需要处理，执行退出。")
+            return
 
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
             config, args, effective_codes
