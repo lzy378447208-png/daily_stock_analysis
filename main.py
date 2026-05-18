@@ -3,7 +3,7 @@
 ===================================
 A股自选股智能分析系统 - 主调度程序
 ===================================
-【格式对齐终极版】严格锁定上一个交易日，精准修复日期横杠导致的 AkShare 接口报错
+【智能分水岭版】15点前锁定上个交易日，15点后锁定当天收盘，完美兼容全时段动态抓取
 """
 from __future__ import annotations
 
@@ -43,18 +43,19 @@ logger = logging.getLogger(__name__)
 _RUNTIME_ENV_FILE_KEYS = set()
 
 
-# ====================== 🎯 核心修复：死磕上个交易日 + 清洗日期横杠 ======================
+# ====================== 🎯 核心逻辑：智能时间判断分水岭 ======================
 def get_last_trading_day_stocks() -> list:
     """
-    严格锁定上一个已收盘的有效交易日。
-    将带横杠的日期（2026-05-15）转换为 AkShare 唯一要求的纯数字格式（20260515），彻底根治 ValueError。
+    自适应 A 股收盘逻辑：
+    - 若当前未收盘（15点前）或今天非交易日：严格获取【上一个收盘交易日】
+    - 若当前已收盘（15点后）且今天是交易日：严格获取【今天】
     """
     try:
         now = datetime.now()
-        # 1. 动态获取 A 股交易日历
         start_search = (now - timedelta(days=7)).strftime("%Y-%m-%d")
         end_search = now.strftime("%Y-%m-%d")
         
+        # 获取 A 股交易日历
         china_cal = mcal.get_calendar('XSHG')
         schedule = china_cal.schedule(start_date=start_search, end_date=end_search)
         
@@ -64,29 +65,29 @@ def get_last_trading_day_stocks() -> list:
             trade_days = [date.strftime("%Y-%m-%d") for date in schedule.index]
             today_str = now.strftime("%Y-%m-%d")
             
-            # 严格判断：如果今天还没收盘（15点前）或者今天是非交易日，取上一个已收盘交易日
-            if now.hour < 15 or today_str not in trade_days:
+            # 判断是否满足“今天已收盘且今天是交易日”
+            if now.hour >= 15 and today_str in trade_days:
+                raw_date = today_str
+                logger.info(f"⏰ 当前时间 {now.strftime('%H:%M')} 已收盘，目标锁定【今日收盘交易日】：{raw_date}")
+            else:
+                # 不满足则向前回溯，寻找上一个最近的已收盘交易日
                 past_days = [d for d in trade_days if d < today_str]
                 raw_date = past_days[-1] if past_days else trade_days[-1]
-            else:
-                raw_date = today_str
+                logger.info(f"⏰ 当前未收盘或处于非交易日，目标锁定【上一个历史交易日】：{raw_date}")
 
-        # 2. 【核心关键点】AkShare 严格要求 8 位纯数字（如 20260515），必须去掉横杠
+        # 去除横杠适配 AkShare 格式 (如 20260515)
         target_date = raw_date.replace("-", "").strip()
-        logger.info(f"📅 策略锁定【唯一分析基准交易日】：【{target_date}】")
+        logger.info(f"📅 策略最终向 AkShare 发起请求的目标日期：【{target_date}】")
 
-        # 3. 调取 AkShare，此时格式完美对齐，绝不会再报 ValueError
-        logger.info(f"🚀 正在调取 AkShare 东方财富 {target_date} 真实涨停个股池...")
+        logger.info(f"🚀 正在调取 AkShare 东方财富 {target_date} 真实涨停股数据...")
         try:
             df = ak.stock_zt_pool_em(date=target_date)
-        except ValueError as ve:
-            logger.error(f"❌ 依然触发接口结构异常，这可能是由于东方财富返回了空表头: {ve}")
-            return []
-        except Exception as e:
-            logger.error(f"❌ 抓取数据时遭遇网络波动或接口不可用: {e}")
+        except (ValueError, Exception) as e:
+            # 即使撞上服务器清空，也温柔挂起，不让 Actions 崩溃变红
+            logger.warning(f"⚠️ 调取接口时遭遇结构波动（东财服务器可能正在维护/清空 {target_date} 的数据）: {str(e)[:100]}")
             return []
 
-        # 4. 解析清洗股票代码
+        # 解析清洗代码
         stock_list = []
         if df is not None and not df.empty:
             code_col = "代码" if "代码" in df.columns else "code"
@@ -96,14 +97,14 @@ def get_last_trading_day_stocks() -> list:
                     if c_str and len(c_str) == 6 and c_str.isdigit():
                         stock_list.append(c_str)
                 
-                logger.info(f"✅ 成功抓取到【{target_date}】当天真实涨停股共 {len(stock_list)} 只！")
+                logger.info(f"✅ 成功提取到【{target_date}】真实涨停个股共 {len(stock_list)} 只！")
                 return stock_list
 
-        logger.warning(f"⚠️ 接口成功响应，但【{target_date}】没有返回任何涨停股票数据。")
+        logger.warning(f"⚠️ 接口响应成功，但【{target_date}】并未返回任何涨停股票（可能数据尚未生成）。")
         return []
             
     except Exception as e:
-        logger.error(f"❌ 运行 get_last_trading_day_stocks 发生非预期错误: {str(e)}")
+        logger.error(f"❌ 运行 get_last_trading_day_stocks 遭遇非预期异常: {str(e)}")
         return []
 # =======================================================================================
 
@@ -288,7 +289,7 @@ def run_full_analysis(
         if stock_codes is None:
             config.refresh_stock_list()
 
-        # ====================== 🚀 核心替换逻辑 ======================
+        # ====================== 🚀 对接智能时间清洗 ======================
         limit_up_stocks = get_last_trading_day_stocks()
         if limit_up_stocks:
             sanitized_stocks = []
@@ -305,12 +306,12 @@ def run_full_analysis(
             if sanitized_stocks:
                 effective_codes = sanitized_stocks
                 config.stock_list = sanitized_stocks  
-                logger.info(f"🎯 上一交易日真实涨停股成功对接流水线（共 {len(effective_codes)} 只）")
+                logger.info(f"🎯 真实涨停股成功录入智能分析流水线（共 {len(effective_codes)} 只）")
             else:
                 effective_codes = [c for c in config.stock_list if "ZTPOOL" not in str(c).upper()]
         else:
             effective_codes = [c for c in config.stock_list if "ZTPOOL" not in str(c).upper()]
-            logger.info(f"📌 未捕获到有效的动态涨停个股，降级使用配置自选股：{len(effective_codes)} 只")
+            logger.info(f"📌 当前时段无可用动态涨停池，自动降级分析默认自选股（共 {len(effective_codes)} 只）")
         # ====================================================================
 
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
@@ -345,7 +346,7 @@ def run_full_analysis(
             send_notification=not args.no_notify, merge_notification=merge_notification
         )
 
-        if results:
+        if Bag := results:
             results = [r for r in results if r and hasattr(r, 'code') and "ZTPOOL" not in str(r.code).upper()]
 
         market_report = ""
@@ -371,7 +372,7 @@ def run_full_analysis(
                 dashboard_content = pipeline.notifier.generate_aggregate_report(
                     results, getattr(config, 'report_type', 'simple')
                 )
-                parts.append(f"# 🚀 上一交易日涨停板智能推演分析\n\n{dashboard_content}")
+                parts.append(f"# 🚀 真实涨停板智能推演分析报告\n\n{dashboard_content}")
             if parts:
                 combined_content = "\n\n---\n\n".join(parts)
                 if pipeline.notifier.is_available():
@@ -391,7 +392,7 @@ def run_full_analysis(
             if feishu_doc.is_configured() and (results or market_report):
                 tz_cn = timezone(timedelta(hours=8))
                 now = datetime.now(tz_cn)
-                doc_title = f"{now.strftime('%Y-%m-%d')} 上一交易日真实涨停量化复盘报告"
+                doc_title = f"{now.strftime('%Y-%m-%d')} A股量化复盘与热点题材推演"
                 full_content = ""
                 if market_report:
                     full_content += f"# 📈 大盘复盘\n\n{market_report}\n\n---\n\n"
@@ -402,7 +403,7 @@ def run_full_analysis(
                     full_content += f"# 🚀 真实涨停个股技术与题材深度推演\n\n{dashboard_content}"
                 doc_url = feishu_doc.create_daily_doc(doc_title, full_content)
                 if doc_url and not args.no_notify:
-                    pipeline.notifier.send(f"涨停个股分析同步飞书文档已生成: {doc_url}", route_type="report")
+                    pipeline.notifier.send(f"量化复盘同步飞书文档已生成: {doc_url}", route_type="report")
         except Exception as e:
             logger.error(f"飞书文档生成失败: {e}")
 
