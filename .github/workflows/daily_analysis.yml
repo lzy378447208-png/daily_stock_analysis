@@ -35,7 +35,7 @@ jobs:
     timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '30') }}
     
     steps:
-      - name: 随机延迟（避免固定整点并发访问）
+      - name: 随机延迟（避免固定时间并发访问风控）
         run: sleep $((RANDOM % 300))  # 随机延迟 0-300 秒启动，对云端接口更友好
       
       - name: 检出代码
@@ -98,7 +98,7 @@ jobs:
           ANTHROPIC_API_KEYS: ${{ secrets.ANTHROPIC_API_KEYS }}
           ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || secrets.ANTHROPIC_MODEL || 'claude-3-5-sonnet-20241022' }}
 
-          # 多渠道协议映射
+          # 渠道模式（多厂商协议映射）
           LLM_PRIMARY_PROTOCOL: ${{ vars.LLM_PRIMARY_PROTOCOL || secrets.LLM_PRIMARY_PROTOCOL }}
           LLM_PRIMARY_BASE_URL: ${{ vars.LLM_PRIMARY_BASE_URL || secrets.LLM_PRIMARY_BASE_URL }}
           LLM_PRIMARY_API_KEY: ${{ secrets.LLM_PRIMARY_API_KEY }}
@@ -189,7 +189,7 @@ jobs:
 
           LLM_MINIMAX_PROTOCOL: ${{ vars.LLM_MINIMAX_PROTOCOL || secrets.LLM_MINIMAX_PROTOCOL }}
           LLM_MINIMAX_BASE_URL: ${{ vars.LLM_MINIMAX_BASE_URL || secrets.LLM_MINIMAX_BASE_URL }}
-          rm LLM_MINIMAX_API_KEY: ${{ secrets.LLM_MINIMAX_API_KEY }}
+          LLM_MINIMAX_API_KEY: ${{ secrets.LLM_MINIMAX_API_KEY }}  # ✅ 已修复：去除了残留的 "rm" 语法错误
           LLM_MINIMAX_API_KEYS: ${{ secrets.LLM_MINIMAX_API_KEYS }}
           LLM_MINIMAX_MODELS: ${{ vars.LLM_MINIMAX_MODELS || secrets.LLM_MINIMAX_MODELS }}
           LLM_MINIMAX_ENABLED: ${{ vars.LLM_MINIMAX_ENABLED || secrets.LLM_MINIMAX_ENABLED }}
@@ -227,18 +227,18 @@ jobs:
           LLM_OLLAMA_ENABLED: ${{ vars.LLM_OLLAMA_ENABLED || secrets.LLM_OLLAMA_ENABLED }}
           LLM_OLLAMA_EXTRA_HEADERS: ${{ vars.LLM_OLLAMA_EXTRA_HEADERS || secrets.LLM_OLLAMA_EXTRA_HEADERS }}
 
-          # 数据源与基础配置
+          # ==========================================
+          # 数据源与基础环境映射
+          # ==========================================
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
           LONGBRIDGE_APP_KEY: ${{ secrets.LONGBRIDGE_APP_KEY }}
           LONGBRIDGE_APP_SECRET: ${{ secrets.LONGBRIDGE_APP_SECRET }}
           LONGBRIDGE_ACCESS_TOKEN: ${{ secrets.LONGBRIDGE_ACCESS_TOKEN }}
           
-          # 搜索引擎
           BOCHA_API_KEYS: ${{ secrets.BOCHA_API_KEYS }}
           TAVILY_API_KEYS: ${{ secrets.TAVILY_API_KEYS }}
           SERPAPI_API_KEYS: ${{ secrets.SERPAPI_API_KEYS }}
 
-          # 通知渠道
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
@@ -249,7 +249,6 @@ jobs:
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           FEISHU_FOLDER_TOKEN: ${{ secrets.FEISHU_FOLDER_TOKEN }}
 
-          # 策略运行环境自适应
           STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST || '600519' }}
           REPORT_TYPE: ${{ vars.REPORT_TYPE || secrets.REPORT_TYPE || 'simple' }}
           MARKET_REVIEW_ENABLED: ${{ vars.MARKET_REVIEW_ENABLED || secrets.MARKET_REVIEW_ENABLED || 'true' }}
@@ -260,6 +259,7 @@ jobs:
 
         run: |
           if [ -n "$LITELLM_CONFIG_YAML" ] && [ -n "$LITELLM_CONFIG" ]; then
+            echo "📝 写入 LiteLLM 云端配置文件..."
             mkdir -p "$(dirname "$LITELLM_CONFIG")"
             echo "$LITELLM_CONFIG_YAML" > "$LITELLM_CONFIG"
           fi
@@ -268,8 +268,10 @@ jobs:
           FORCE_RUN_ARG=""
           if [ "${{ github.event.inputs.force_run }}" = "true" ]; then
             FORCE_RUN_ARG="--force-run"
+            echo "⚡ 已启用强制运行模式（跳过交易日检查）"
           fi
 
+          echo "⏰ 启动分析时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
           if [ "$MODE" = "market-only" ]; then
             python main.py --market-review $FORCE_RUN_ARG
           elif [ "$MODE" = "stocks-only" ]; then
@@ -292,15 +294,17 @@ jobs:
         if: always()
         run: |
           echo "=========================================="
-          echo "📊 任务阶段性分析完成"
+          echo "📊 任务收尾与日志回放"
           echo "=========================================="
           if [ -d "reports" ] && [ "$(ls -A reports 2>/dev/null)" ]; then
+            echo "生成的离线报告文件列表:"
             ls -la reports/
           else
-            echo "⚠️ 未生成离线报告"
+            echo "⚠️ 未生成离线报告（可能通过第三方通道直接实时推送）"
           fi
           echo ""
+          # ✅ 已优化：直接用通配符匹配最新的本地日志，避开系统时区不合导致匹配失败的问题
           if [ -d "logs" ] && [ "$(ls -A logs 2>/dev/null)" ]; then
-            echo "📜 实时运行日志（最后 30 行）:"
+            echo "📜 任务执行详细回放（最后 30 行）:"
             tail -30 logs/*.log 2>/dev/null
           fi
