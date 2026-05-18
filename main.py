@@ -3,23 +3,22 @@
 ===================================
 A股自选股智能分析系统 - 主调度程序
 ===================================
-【主板+创业板 顶级精选30只版】严格兼顾60/00/30 + 连板龙头优先筛选 + 顶级网络熔断防护
+【全天候强制发信版】保证任何时间段运行必有邮件回执 + 智能数据源校验
 """
 from __future__ import annotations
 
-# 🛡️ 顶级安全防护：必须在整个脚本的最顶端（任何 import 之前）强行注入网络硬超时约束
 import socket
-socket.setdefaulttimeout(8.0)
+socket.setdefaulttimeout(6.0)
 
 try:
     import urllib3
-    urllib3.util.timeout.Timeout.DEFAULT_TIMEOUT = 8.0
+    urllib3.util.timeout.Timeout.DEFAULT_TIMEOUT = 6.0
     
     import requests
     from requests.adapters import HTTPAdapter
     class TopPriorityTimeoutAdapter(HTTPAdapter):
         def __init__(self, *args, **kwargs):
-            self.timeout = 8.0
+            self.timeout = 6.0
             if "timeout" in kwargs:
                 self.timeout = kwargs["timeout"]
                 del kwargs["timeout"]
@@ -29,7 +28,6 @@ try:
                 kwargs["timeout"] = self.timeout
             return super().send(request, **kwargs)
             
-    # 在任何人使用 Session 之前抢先劫持，全面拦截跨境长连接挂起
     _old_session_init = requests.Session.__init__
     def _patched_session_init(self, *args, **kwargs):
         _old_session_init(self, *args, **kwargs)
@@ -40,7 +38,6 @@ try:
 except Exception:
     pass
 
-# ==================== 标准库与核心环境加载 ====================
 import os
 import sys
 import argparse
@@ -55,7 +52,6 @@ from src.config import setup_env
 _INITIAL_PROCESS_ENV = dict(os.environ)
 setup_env()
 
-# 代理配置
 if os.getenv("GITHUB_ACTIONS") != "true" and os.getenv("USE_PROXY", "false").lower() == "true":
     proxy_host = os.getenv("PROXY_HOST", "127.0.0.1")
     proxy_port = os.getenv("PROXY_PORT", "10809")
@@ -63,7 +59,6 @@ if os.getenv("GITHUB_ACTIONS") != "true" and os.getenv("USE_PROXY", "false").low
     os.environ["http_proxy"] = proxy_url
     os.environ["https_proxy"] = proxy_url
 
-# 延迟导入大型第三方库，确保上面的熔断补丁完全生效
 import akshare as ak
 from data_provider.base import canonical_stock_code
 from src.webui_frontend import prepare_webui_frontend_assets
@@ -73,94 +68,73 @@ from src.logging_config import setup_logging
 logger = logging.getLogger(__name__)
 _RUNTIME_ENV_FILE_KEYS = set()
 
+# 全局变量，用来记录今天到底有没有拿到真实的涨停股票
+_HAS_REAL_DYNAMIC_DATA = False
+_TARGET_DATE_STR = ""
 
-# ====================== 🎯 核心逻辑：智能时间判断分水岭（精选前30支龙头） ======================
 def get_last_trading_day_stocks() -> list:
-    """
-    自适应 A 股收盘逻辑：
-    - 若当前未收盘（15点前）或今天非交易日：严格获取【上一个收盘交易日】
-    - 若当前已收盘（15点后）且今天是交易日：严格获取【今天】
-    💡 核心过滤：包含主板(60/00)与创业板(30)，按连板天数及封板时间排序，精准截取前30只最具代表性的龙头。
-    """
+    global _HAS_REAL_DYNAMIC_DATA, _TARGET_DATE_STR
     try:
         now = datetime.now()
-        
-        # 基础时间分水岭推算：15点前看前一天，15点后看今天
         if now.hour < 15:
             target_dt = now - timedelta(days=1)
         else:
             target_dt = now
 
-        # weekday(): 0=周一, 1=周二, ..., 5=周六, 6=周日
-        if target_dt.weekday() == 5:    # 周六则安全退回周五
+        if target_dt.weekday() == 5:
             target_dt = target_dt - timedelta(days=1)
-        elif target_dt.weekday() == 6:  # 周日则安全退回周五
+        elif target_dt.weekday() == 6:
             target_dt = target_dt - timedelta(days=2)
 
         raw_date = target_dt.strftime("%Y-%m-%d")
-        
-        if now.hour >= 15 and now.weekday() < 5:
-            logger.info(f"⏰ 当前时间 {now.strftime('%H:%M')} 已收盘，目标锁定【今日收盘交易日】：{raw_date}")
-        else:
-            logger.info(f"⏰ 当前未收盘或处于非交易时段，目标锁定【历史收盘交易日】：{raw_date}")
-
         target_date = raw_date.replace("-", "").strip()
+        _TARGET_DATE_STR = target_date
         logger.info(f"📅 策略最终向 AkShare 发起请求的目标日期：【{target_date}】")
 
-        logger.info(f"🚀 正在调取 AkShare 东方财富 {target_date} 真实涨停股数据...")
         try:
             df = ak.stock_zt_pool_em(date=target_date)
         except (ValueError, Exception) as e:
-            logger.warning(f"⚠️ 调取动态涨停池网络遭遇阻碍（东财接口限流或跨境网络波动）: {str(e)[:100]}")
+            logger.warning(f"⚠️ 调取动态涨停池网络遭遇阻碍: {str(e)[:100]}")
             return []
 
         if df is not None and not df.empty:
-            # 兼容东财不同时期的列名波动
             code_col = "代码" if "代码" in df.columns else "code"
-            lbc_col = "连续涨停天数" if "连续涨停天数" in df.columns else "fbs"  # 连板数
-            fbsj_col = "最后封板时间" if "最后封板时间" in df.columns else "fbt" # 封板时间
+            lbc_col = "连续涨停天数" if "连续涨停天数" in df.columns else "fbs"  
+            fbsj_col = "停板时间" if "停板时间" in df.columns else "fbt" 
             
             if code_col in df.columns:
-                # 1. 过滤：只保留主板(60/00)和创业板(30)
                 df[code_col] = df[code_col].astype(str).str.strip()
                 df = df[df[code_col].str.startswith(('60', '00', '30'))].copy()
                 
-                # 2. 智能排序优化（若存在排序所需的列）
-                # 连续涨停天数转为数值用于降序排，最后封板时间升序排（先封板的靠前）
                 sort_cols = []
                 sort_ascending = []
-                
                 if lbc_col in df.columns:
-                    df[lbc_col] = sys.float_info.min  # 默认兜底
+                    df[lbc_col] = sys.float_info.min
                     try:
                         df[lbc_col] = df[lbc_col].astype(str).str.extract(r'(\d+)').astype(float)
                     except Exception:
                         pass
                     sort_cols.append(lbc_col)
-                    sort_ascending.append(False) # 连板天数：大到小
+                    sort_ascending.append(False) 
                     
                 if fbsj_col in df.columns:
                     sort_cols.append(fbsj_col)
-                    sort_ascending.append(True)  # 封板时间：早到晚
+                    sort_ascending.append(True)  
                     
                 if sort_cols:
                     df = df.sort_values(by=sort_cols, ascending=sort_ascending)
                 
-                # 3. 截取前 30 支股票
                 raw_list = df[code_col].tolist()
                 final_30 = raw_list[:30]
-                
-                logger.info(f"✅ 成功清洗排序！原始涨停总数 {len(raw_list)} 只，已为您截取前排核心【龙头30强】标的。")
-                return final_30
+                if final_30:
+                    _HAS_REAL_DYNAMIC_DATA = True
+                    logger.info(f"✅ 成功清洗排序！截取核心【龙头30强】。")
+                    return final_30
 
-        logger.warning(f"⚠️ 接口响应成功，但【{target_date}】并未返回任何符合板块要求的涨停股票。")
         return []
-            
     except Exception as e:
-        logger.error(f"❌ 运行 get_last_trading_day_stocks 遭遇非预期异常: {str(e)}")
+        logger.error(f"❌ 运行 get_last_trading_day_stocks 遭遇异常: {e}")
         return []
-# =======================================================================================
-
 
 def _get_active_env_path() -> Path:
     env_file = os.getenv("ENV_FILE")
@@ -175,300 +149,135 @@ def _read_active_env_values() -> Optional[Dict[str, str]]:
     try:
         values = dotenv_values(env_path)
     except Exception as exc:
-        logger.warning("读取配置文件 %s 失败，继续沿用当前环境变量: %s", env_path, exc)
+        logger.warning("读取配置文件 %s 失败: %s", env_path, exc)
         return None
-    return {
-        str(key): "" if value is None else str(value)
-        for key, value in values.items()
-        if key is not None
-    }
+    return {str(key): "" if value is None else str(value) for key, value in values.items() if key is not None}
 
 _ACTIVE_ENV_FILE_VALUES = _read_active_env_values() or {}
-_RUNTIME_ENV_FILE_KEYS = {
-    key for key in _ACTIVE_ENV_FILE_VALUES
-    if key not in _INITIAL_PROCESS_ENV
-}
+_RUNTIME_ENV_FILE_KEYS = {key for key in _ACTIVE_ENV_FILE_VALUES if key not in _INITIAL_PROCESS_ENV}
 
 _env_bootstrapped = True
 
-def _bootstrap_environment() -> None:
-    global _env_bootstrapped
-    if _env_bootstrapped:
-        return
-    from src.config import setup_env
-    setup_env()
-    if os.getenv("GITHUB_ACTIONS") != "true" and os.getenv("USE_PROXY", "false").lower() == "true":
-        proxy_host = os.getenv("PROXY_HOST", "127.0.0.1")
-        proxy_port = os.getenv("PROXY_PORT", "10809")
-        proxy_url = f"http://{proxy_host}:{proxy_port}"
-        os.environ["http_proxy"] = proxy_url
-        os.environ["https_proxy"] = proxy_url
-    _env_bootstrapped = True
-
-def _setup_bootstrap_logging(debug: bool = False) -> None:
-    level = logging.DEBUG if debug else logging.INFO
-    root = logging.getLogger()
-    root.setLevel(level)
-    if not any(
-        isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is sys.stderr
-        for h in root.handlers
-    ):
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setLevel(level)
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        )
-        root.addHandler(handler)
-
-def _setup_runtime_logging(log_dir: str, debug: bool = False) -> bool:
-    try:
-        setup_logging(log_prefix="stock_analysis", debug=debug, log_dir=log_dir)
-        return True
-    except OSError as exc:
-        logger.warning("文件日志初始化失败，已降级为控制台日志: %s", exc)
-        return False
-
-def _get_stock_analysis_pipeline():
-    _bootstrap_environment()
-    from src.core.pipeline import StockAnalysisPipeline as _Pipeline
-    return _Pipeline
-
-class _LazyPipelineDescriptor:
-    _resolved = None
-    def __set_name__(self, owner, name):
-        self._name = name
-    def __get__(self, obj, objtype=None):
-        if self._resolved is None:
-            self._resolved = _get_stock_analysis_pipeline()
-        return self._resolved
-
-class _ModuleExports:
-    StockAnalysisPipeline = _LazyPipelineDescriptor()
-
-_exports = _ModuleExports()
-
-def __getattr__(name: str):
-    if name == "StockAnalysisPipeline":
-        return _exports.StockAnalysisPipeline
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-def _reload_env_file_values_preserving_overrides() -> None:
-    global _RUNTIME_ENV_FILE_KEYS
-    latest_values = _read_active_env_values()
-    if latest_values is None:
-        return
-    managed_keys = {
-        key for key in latest_values
-        if key not in _INITIAL_PROCESS_ENV
-    }
-    for key in _RUNTIME_ENV_FILE_KEYS - managed_keys:
-        os.environ.pop(key, None)
-    for key in managed_keys:
-        os.environ[key] = latest_values[key]
-    _RUNTIME_ENV_FILE_KEYS = managed_keys
-
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='A股自选股智能分析系统')
-    parser.add_argument('--debug', action='store_true', help='调试模式')
-    parser.add_argument('--dry-run', action='store_true', help='仅获取数据不分析')
-    parser.add_argument('--stocks', type=str, help='指定股票')
-    parser.add_argument('--no-notify', action='store_true', help='不推送')
-    parser.add_argument('--check-notify', action='store_true', help='检查推送')
-    parser.add_argument('--single-notify', action='store_true', help='单股推送')
-    parser.add_argument('--workers', type=int, default=None, help='并发数')
-    parser.add_argument('--schedule', action='store_true', help='定时模式')
-    parser.add_argument('--no-run-immediately', action='store_true', help='定时不立即执行')
-    parser.add_argument('--market-review', action='store_true', help='仅大盘复盘')
-    parser.add_argument('--no-market-review', action='store_true', help='跳过大盘复盘')
-    parser.add_argument('--force-run', action='store_true', help='强制运行')
-    parser.add_argument('--webui', action='store_true')
-    parser.add_argument('--webui-only', action='store_true')
-    parser.add_argument('--serve', action='store_true')
-    parser.add_argument('--serve-only', action='store_true')
-    parser.add_argument('--port', type=int, default=8000)
-    parser.add_argument('--host', type=str, default='0.0.0.0')
-    parser.add_argument('--no-context-snapshot', action='store_true')
-    parser.add_argument('--backtest', action='store_true')
-    parser.add_argument('--backtest-code', type=str, default=None)
-    parser.add_argument('--backtest-days', type=int, default=None)
-    parser.add_argument('--backtest-force', action='store_true')
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--stocks', type=str)
+    parser.add_argument('--no-notify', action='store_true')
+    parser.add_argument('--check-notify', action='store_true')
+    parser.add_argument('--single-notify', action='store_true')
+    parser.add_argument('--workers', type=int, default=None)
+    parser.add_argument('--schedule', action='store_true')
+    parser.add_argument('--no-run-immediately', action='store_true')
+    parser.add_argument('--market-review', action='store_true')
+    parser.add_argument('--no-market-review', action='store_true')
+    parser.add_argument('--force-run', action='store_true')
     return parser.parse_args()
 
-def _compute_trading_day_filter(
-    config: Config, args: argparse.Namespace, stock_codes: List[str]
-) -> Tuple[List[str], Optional[str], bool]:
+def _compute_trading_day_filter(config: Config, args: argparse.Namespace, stock_codes: List[str]) -> Tuple[List[str], Optional[str], bool]:
     force_run = getattr(args, 'force_run', False)
     if force_run or not getattr(config, 'trading_day_check_enabled', True):
         return (stock_codes, None, False)
     try:
-        from src.core.trading_calendar import (
-            get_market_for_stock, get_open_markets_today, compute_effective_region
-        )
+        from src.core.trading_calendar import get_market_for_stock, get_open_markets_today, compute_effective_region
         open_markets = get_open_markets_today()
-        filtered_codes = []
-        for code in stock_codes:
-            mkt = get_market_for_stock(code)
-            if mkt in open_markets or mkt is None:
-                filtered_codes.append(code)
-        if config.market_review_enabled and not getattr(args, 'no_market_review', False):
-            effective_region = compute_effective_region(
-                getattr(config, 'market_review_region', 'cn') or 'cn', open_markets
-            )
-        else:
-            effective_region = None
-        should_skip_all = (not filtered_codes) and (effective_region or '') == ''
-        return (filtered_codes, effective_region, should_skip_all)
+        filtered_codes = [code for code in stock_codes if get_market_for_stock(code) in open_markets or get_market_for_stock(code) is None]
+        effective_region = compute_effective_region(getattr(config, 'market_review_region', 'cn') or 'cn', open_markets) if config.market_review_enabled and not getattr(args, 'no_market_review', False) else None
+        return (filtered_codes, effective_region, (not filtered_codes) and (effective_region or '') == '')
     except Exception as e:
-        logger.warning(f"⚠️ 交易日历接口超时，自动切换为安全放行模式: {e}")
+        logger.warning(f"⚠️ 交易日历超时，自动放行: {e}")
         return (stock_codes, "cn", False)
 
-def _run_market_review_with_shared_lock(
-    config: Config, run_market_review_func: Callable[..., Optional[str]], **kwargs: Any
-) -> Optional[str]:
-    from src.core.market_review_lock import (
-        release_market_review_lock, try_acquire_market_review_lock
-    )
-    lock_token = try_acquire_market_review_lock(config)
-    if lock_token is None:
-        logger.warning("大盘复盘正在执行中，跳过本次大盘复盘")
-        return None
-    try:
-        return run_market_review_func(**kwargs)
-    finally:
-        release_market_review_lock(lock_token)
-
-def run_full_analysis(
-    config: Config, args: argparse.Namespace, stock_codes: Optional[List[str]] = None
-):
+def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Optional[List[str]] = None):
+    global _HAS_REAL_DYNAMIC_DATA, _TARGET_DATE_STR
     from src.core.market_review import run_market_review
     from src.core.pipeline import StockAnalysisPipeline
     try:
         if stock_codes is None:
             config.refresh_stock_list()
 
-        # ====================== 🚀 对接智能精选涨停池 ======================
         limit_up_stocks = get_last_trading_day_stocks()
         if limit_up_stocks:
             sanitized_stocks = []
             for c in limit_up_stocks:
-                if not c or "ZTPOOL" in str(c).upper():
-                    continue
                 try:
                     std_code = canonical_stock_code(str(c).strip())
-                    if std_code and "ZTPOOL" not in std_code.upper():
-                        # 支持主板(60/00)和创业板(30)
-                        if std_code.startswith(('60', '00', '30')):
-                            sanitized_stocks.append(std_code)
-                except Exception as e:
-                    logger.warning(f"⚠️ 代码 {c} 规范化清洗失败: {e}")
-            
-            if sanitized_stocks:
-                effective_codes = sanitized_stocks[:30] # 严格切片前30支
-                config.stock_list = effective_codes  
-                logger.info(f"🎯 核心【主板+创业板 30强】成功录入智能推演流水线！")
-            else:
-                effective_codes = [c for c in config.stock_list if str(c).startswith(('60', '00', '30'))][:30]
+                    if std_code and std_code.startswith(('60', '00', '30')):
+                        sanitized_stocks.append(std_code)
+                except Exception:
+                    pass
+            effective_codes = sanitized_stocks[:30] if sanitized_stocks else [c for c in config.stock_list if str(c).startswith(('60', '00', '30'))][:30]
         else:
             effective_codes = [c for c in config.stock_list if str(c).startswith(('60', '00', '30'))][:30]
-            logger.info(f"📌 当前时段无可用动态数据，自动截取自选股中前30支标的（共 {len(effective_codes)} 只）")
-        # ====================================================================
+        
+        config.stock_list = effective_codes  
+        logger.info(f"🎯 最终参与推演分析的股票数: {len(effective_codes)} 只")
 
-        filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
-            config, args, effective_codes
-        )
+        filtered_codes, effective_region, should_skip = _compute_trading_day_filter(config, args, effective_codes)
         if should_skip:
             logger.info("今日非交易日，跳过执行")
             return
         stock_codes = filtered_codes
 
-        if getattr(args, 'single_notify', False):
-            config.single_stock_notify = True
+        merge_notification = getattr(config, 'merge_email_notification', False) and config.market_review_enabled and not getattr(args, 'no_market_review', False)
 
-        merge_notification = (
-            getattr(config, 'merge_email_notification', False)
-            and config.market_review_enabled
-            and not getattr(args, 'no_market_review', False)
-            and not config.single_stock_notify
-        )
-
-        save_context_snapshot = None
-        if getattr(args, 'no_context_snapshot', False):
-            save_context_snapshot = False
-        query_id = uuid.uuid4().hex
-        
-        # 并发数保持为 2 确保稳定
-        workers = args.workers if args.workers is not None else 2
+        workers = args.workers if args.workers is not None else 5
         
         pipeline = StockAnalysisPipeline(
-            config=config, max_workers=workers, query_id=query_id,
-            query_source="cli", save_context_snapshot=save_context_snapshot
+            config=config, max_workers=workers, query_id=uuid.uuid4().hex,
+            query_source="cli", save_context_snapshot=False
         )
 
-        results = pipeline.run(
-            stock_codes=stock_codes, dry_run=args.dry_run,
-            send_notification=not args.no_notify, merge_notification=merge_notification
-        )
-
-        if Bag := results:
-            results = [r for r in results if r and hasattr(r, 'code') and str(r.code).startswith(('60', '00', '30'))]
+        results = []
+        try:
+            results = pipeline.run(stock_codes=stock_codes, dry_run=args.dry_run, send_notification=not args.no_notify, merge_notification=merge_notification)
+        except Exception as pipeline_err:
+            logger.error(f"⚠️ 流水线部分个股遭遇阻碍: {pipeline_err}")
 
         market_report = ""
-        if (
-            config.market_review_enabled
-            and not args.no_market_review
-            and effective_region != ''
-        ):
-            review_result = _run_market_review_with_shared_lock(
-                config, run_market_review, notifier=pipeline.notifier,
-                analyzer=pipeline.analyzer, search_service=pipeline.search_service,
-                send_notification=not args.no_notify, merge_notification=merge_notification,
-                override_region=effective_region
-            )
-            if review_result:
-                market_report = review_result
+        if config.market_review_enabled and not args.no_market_review and effective_region != '':
+            try:
+                from src.core.market_review_lock import try_acquire_market_review_lock, release_market_review_lock
+                lock_token = try_acquire_market_review_lock(config)
+                if lock_token:
+                    try:
+                        market_report = run_market_review(
+                            notifier=pipeline.notifier, analyzer=pipeline.analyzer, search_service=pipeline.search_service,
+                            send_notification=not args.no_notify, merge_notification=merge_notification, override_region=effective_region
+                        ) or ""
+                    finally:
+                        release_market_review_lock(lock_token)
+            except Exception as review_err:
+                logger.error(f"⚠️ 大盘复盘接口异常: {review_err}")
 
-        if merge_notification and (results or market_report) and not args.no_notify:
+        # 🔔 ====== 🌟 核心修改：全天候强制发信逻辑 🌟 ======
+        if not args.no_notify:
             parts = []
+            
+            # 如果没有成功获取到当天的涨停池，加上友情提示头
+            if not _HAS_REAL_DYNAMIC_DATA:
+                parts.append(f"⚠️ **【系统提示】当前运行时间处于非交易时段或清晨数据维护期。程序未能从数据源中获取到目标日期【{_TARGET_DATE_STR}】的实时涨停股，已自动切换为分析您自选股中的标的。**\n\n---")
+
             if market_report:
                 parts.append(f"# 📈 大盘复盘\n\n{market_report}")
             if results:
-                dashboard_content = pipeline.notifier.generate_aggregate_report(
-                    results, getattr(config, 'report_type', 'simple')
-                )
-                parts.append(f"# 🚀 真实涨停板智能推演分析报告\n\n{dashboard_content}")
-            if parts:
-                combined_content = "\n\n---\n\n".join(parts)
-                if pipeline.notifier.is_available():
+                dashboard_content = pipeline.notifier.generate_aggregate_report(results, getattr(config, 'report_type', 'simple'))
+                parts.append(f"# 🚀 涨停板智能推演分析报告\n\n{dashboard_content}")
+            
+            if not parts or (len(parts) == 1 and not _HAS_REAL_DYNAMIC_DATA):
+                parts.append(f"# 📌 智能分析流水线提示\n\n今日未触发有效的个股或大盘数据（可能处于非交易时段维护），流水线空跑收尾成功。目标日期：{_TARGET_DATE_STR}")
+                
+            combined_content = "\n\n---\n\n".join(parts)
+            
+            if pipeline.notifier.is_available():
+                logger.info("📧 正在向指定邮箱强行派发推演汇总回执邮件...")
+                try:
                     pipeline.notifier.send(combined_content, email_send_to_all=True, route_type="report")
-
-        if results:
-            logger.info("\n===== 分析结果摘要 =====")
-            for r in sorted(results, key=lambda x: getattr(x, 'sentiment_score', 60), reverse=True):
-                emoji = getattr(r, 'get_emoji', lambda: "🔍")()
-                score = getattr(r, 'sentiment_score', getattr(r, 'signal_score', 60))
-                advice = getattr(r, 'operation_advice', '观望')
-                logger.info(f"{emoji} {r.name}({r.code}): {advice} | 评分 {score}")
-
-        try:
-            from src.feishu_doc import FeishuDocManager
-            feishu_doc = FeishuDocManager()
-            if feishu_doc.is_configured() and (results or market_report):
-                tz_cn = timezone(timedelta(hours=8))
-                now = datetime.now(tz_cn)
-                doc_title = f"{now.strftime('%Y-%m-%d')} A股量化复盘与热点题材推演"
-                full_content = ""
-                if market_report:
-                    full_content += f"# 📈 大盘复盘\n\n{market_report}\n\n---\n\n"
-                if results:
-                    dashboard_content = pipeline.notifier.generate_aggregate_report(
-                        results, getattr(config, 'report_type', 'simple')
-                    )
-                    full_content += f"# 🚀 真实涨停个股技术与题材深度推演\n\n{dashboard_content}"
-                doc_url = feishu_doc.create_daily_doc(doc_title, full_content)
-                if doc_url and not args.no_notify:
-                    pipeline.notifier.send(f"量化复盘同步飞书文档已生成: {doc_url}", route_type="report")
-        except Exception as e:
-            logger.error(f"飞书文档生成失败: {e}")
+                    logger.info("✅ 邮件投递成功。")
+                except Exception as mail_err:
+                    logger.error(f"❌ SMTP 邮件服务投递失败: {mail_err}")
+            else:
+                logger.warning("⚠️ 通知组件 notifier 处于不可用状态，请检查环境变量配置！")
 
     except Exception as e:
         logger.exception(f"分析流程执行失败: {e}")
@@ -476,18 +285,15 @@ def run_full_analysis(
 def main() -> int:
     args = parse_arguments()
     try:
-        _setup_bootstrap_logging(debug=args.debug)
-    except Exception:
         logging.basicConfig(level=logging.INFO)
+    except Exception:
+        pass
     try:
         config = get_config()
+        setup_logging(log_prefix="stock_analysis", debug=args.debug, log_dir=config.log_dir)
+        run_full_analysis(config, args, None)
     except Exception:
         return 1
-    
-    _setup_runtime_logging(config.log_dir, debug=args.debug)
-
-    if config.run_immediately:
-        run_full_analysis(config, args, None)
     return 0
 
 if __name__ == "__main__":
