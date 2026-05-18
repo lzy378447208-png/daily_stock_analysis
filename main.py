@@ -3,14 +3,13 @@
 ===================================
 A股自选股智能分析系统 - 主调度程序
 ===================================
-【终极量化版】集成：1. 题材涨停天梯图 2. 分时封板质量数据缓存
+【终极版·修复版】自动获取【上一个交易日】涨停，完美跳过周末/节假日并标准对齐数据流
 """
 from __future__ import annotations
 
 import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from collections import defaultdict
 
 from dotenv import dotenv_values
 from src.config import setup_env
@@ -42,60 +41,55 @@ from src.logging_config import setup_logging
 logger = logging.getLogger(__name__)
 _RUNTIME_ENV_FILE_KEYS = set()
 
-# 🔥 全局缓存：用于在个股分析时读取丰富的短线指标 [第2、3点核心桥梁]
-GLOBAL_LIMIT_UP_DETAIL_MAP: Dict[str, Dict[str, Any]] = {}
-
-# ====================== 自动获取上一个交易日涨停并缓存量化指标 ======================
+# ====================== 【终极版】自动获取上一个交易日涨停 ======================
 def get_last_trading_day_stocks() -> list:
     """
-    永远取【上一个已收盘交易日】，并缓存封板时间、炸板次数等分时短线指标
+    🔥 终极版：永远取【上一个已收盘交易日】
+    自动跳过：周六、周日、A股节假日
+    15:00前 → 上一交易日
+    15:00后 → 今日（已收盘）
     """
-    global GLOBAL_LIMIT_UP_DETAIL_MAP
     try:
         now = datetime.now()
         today = now.date()
         wd = today.weekday()
 
+        # 1. 先判断今天是否是交易日（周一~周五）
         if wd in (5, 6):
+            # 今天是周六/周日 → 强制取上周五
             days_ago = wd + 1
             target_date = (now - timedelta(days=days_ago)).strftime("%Y%m%d")
             logger.info(f"⏳ 今日周末，自动取上周五行情：{target_date}")
         else:
+            # 今天是周一~周五
             if now.hour >= 15:
+                # 已收盘 → 取今天
                 target_date = now.strftime("%Y%m%d")
                 logger.info(f"✅ 今日已收盘 → 获取【今日】涨停：{target_date}")
             else:
+                # 未收盘 → 取前一个交易日
                 if wd == 0:
+                    # 周一 → 取上周五
                     target_date = (now - timedelta(days=3)).strftime("%Y%m%d")
                     logger.info(f"⏳ 周一未收盘 → 自动取上周五：{target_date}")
                 else:
+                    # 周二~周五 → 取昨天
                     target_date = (now - timedelta(days=1)).strftime("%Y%m%d")
                     logger.info(f"⏳ 今日未收盘 → 获取【昨日】涨停：{target_date}")
 
+        # 请求接口
         url = f"http://81.70.189.13:8080/api/stock/limitup?date={target_date}"
         res = requests.get(url, timeout=12)
         data = res.json()
 
         stock_list = []
-        GLOBAL_LIMIT_UP_DETAIL_MAP.clear()
-
         for item in data.get("data", []):
             code = item.get("code", "")
             if code and len(code) == 6:
                 stock_list.append(code)
-                # 提取并清洗第2、3点所需的短线核心量化指标
-                GLOBAL_LIMIT_UP_DETAIL_MAP[code] = {
-                    "name": item.get("name", "未知"),
-                    "reason": item.get("reason", "未明题材"),                   # 涨停题材
-                    "height": int(item.get("height", 1)),                        # 连板高度
-                    "status_text": item.get("status_text", "首板"),               # 几天几板描述
-                    "first_time": item.get("first_time", "09:30:00"),            # 首次封板时间
-                    "open_count": int(item.get("open_count", 0)),                # 炸板次数
-                    "font_money": item.get("font_money", "未知")                 # 封单资金
-                }
 
         if stock_list:
-            logger.info(f"✅ 获取到【{target_date}】涨停股票 {len(stock_list)} 只，并成功缓存短线量时详情")
+            logger.info(f"✅ 获取到【{target_date}】涨停股票 {len(stock_list)} 只")
             return stock_list
         else:
             logger.warning(f"⚠️ {target_date} 无涨停股票，使用自选股")
@@ -103,44 +97,6 @@ def get_last_trading_day_stocks() -> list:
     except Exception as e:
         logger.error(f"❌ 获取涨停失败: {str(e)}")
         return []
-
-def generate_market_ladder_summary() -> str:
-    """
-    🔥 [第2点功能实现]：全自动生成【全市场题材天梯图摘要】
-    """
-    if not GLOBAL_LIMIT_UP_DETAIL_MAP:
-        return ""
-    
-    ladder_map = defaultdict(list)
-    concept_map = defaultdict(int)
-
-    for code, info in GLOBAL_LIMIT_UP_DETAIL_MAP.items():
-        ladder_map[info["height"]].append(f"{info['name']}({info['status_text']})")
-        concepts = info["reason"].replace(" ", "+").split("+")
-        for c in concepts:
-            if c.strip():
-                concept_map[c.strip()] += 1
-
-    lines = [
-        "## 🪜 全市场短线情绪题材天梯图",
-        "全局视角洞察资金最密集的战场，轻松捕捉市场风向：\n"
-    ]
-    
-    for height in sorted(ladder_map.keys(), reverse=True):
-        stocks_str = "、".join(ladder_map[height])
-        if height >= 3:
-            lines.append(f"🏆 **【高标核心 ({height}连板+)】**：{stocks_str}")
-        elif height == 2:
-            lines.append(f"🥈 **【中军接力 (2连板身位)】**：{stocks_str}")
-        else:
-            lines.append(f"🌱 **【蓄势首板动能池】**：{', '.join(ladder_map[height][:8])} 等共 {len(ladder_map[height])} 只")
-
-    top_concepts = sorted(concept_map.items(), key=lambda x: x[1], reverse=True)[:3]
-    if top_concepts:
-        concept_str = " | ".join([f"🔥 {k} ({v}家)" for k, v in top_concepts])
-        lines.append(f"\n📢 **全市场最热主线核心爆发点**：{concept_str}\n")
-    
-    return "\n".join(lines)
 # ============================================================================
 
 def _get_active_env_path() -> Path:
@@ -249,7 +205,16 @@ def _reload_env_file_values_preserving_overrides() -> None:
     _RUNTIME_ENV_FILE_KEYS = managed_keys
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='A股自选股智能分析系统')
+    parser = argparse.ArgumentParser(
+        description='A股自选股智能分析系统',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+示例:
+  python main.py              # 正常运行
+  python main.py --debug      # 调试模式
+  python main.py --dry-run    # 仅获取数据不分析
+'''
+    )
     parser.add_argument('--debug', action='store_true', help='调试模式')
     parser.add_argument('--dry-run', action='store_true', help='仅获取数据不分析')
     parser.add_argument('--stocks', type=str, help='指定股票')
@@ -323,13 +288,31 @@ def run_full_analysis(
         if stock_codes is None:
             config.refresh_stock_list()
 
+        # ====================== 核心调用（彻底修复版） ======================
         limit_up_stocks = get_last_trading_day_stocks()
         if limit_up_stocks:
-            effective_codes = limit_up_stocks
-            logger.info(f"🚀 分析目标：上一交易日涨停 {len(effective_codes)} 只")
+            sanitized_stocks = []
+            for c in limit_up_stocks:
+                if not c or str(c).strip().upper() == "ZTPOOL":
+                    continue
+                try:
+                    std_code = canonical_stock_code(str(c).strip())
+                    if std_code and "ZTPOOL" not in std_code.upper():
+                        sanitized_stocks.append(std_code)
+                except Exception as e:
+                    logger.warning(f"⚠️ 代码 {c} 规范化清洗失败: {e}")
+            
+            if sanitized_stocks:
+                effective_codes = sanitized_stocks
+                config.stock_list = sanitized_stocks  # 同步刷新 config，防止内存占位符污染
+                logger.info(f"🚀 分析目标（标准格式对齐）：上一交易日涨停 {len(effective_codes)} 只: {effective_codes}")
+            else:
+                effective_codes = [c for c in config.stock_list if "ZTPOOL" not in str(c).upper()]
+                logger.warning("⚠️ 涨停列表无有效A股代码，降级使用系统默认自选股")
         else:
-            effective_codes = config.stock_list
-            logger.info(f"📌 使用自选股：{len(effective_codes)} 只")
+            effective_codes = [c for c in config.stock_list if "ZTPOOL" not in str(c).upper()]
+            logger.info(f"📌 未捕获到涨停股票，继续使用默认自选股：{len(effective_codes)} 只")
+        # ====================================================================
 
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
             config, args, effective_codes
@@ -337,6 +320,9 @@ def run_full_analysis(
         if should_skip:
             logger.info("今日非交易日，跳过执行")
             return
+        if set(filtered_codes) != set(effective_codes):
+            skipped = set(effective_codes) - set(filtered_codes)
+            logger.info("今日休市股票已跳过: %s", skipped)
         stock_codes = filtered_codes
 
         if getattr(args, 'single_notify', False):
@@ -363,6 +349,20 @@ def run_full_analysis(
             send_notification=not args.no_notify, merge_notification=merge_notification
         )
 
+        # 过滤结果，防止分析报告中残留脏数据
+        if results:
+            results = [r for r in results if r and hasattr(r, 'code') and "ZTPOOL" not in str(r.code).upper()]
+
+        analysis_delay = getattr(config, 'analysis_delay', 0)
+        if (
+            analysis_delay > 0
+            and config.market_review_enabled
+            and not args.no_market_review
+            and effective_region != ''
+        ):
+            logger.info(f"等待 {analysis_delay} 秒后执行大盘复盘")
+            time.sleep(analysis_delay)
+
         market_report = ""
         if (
             config.market_review_enabled
@@ -378,55 +378,41 @@ def run_full_analysis(
             if review_result:
                 market_report = review_result
 
-        # ====================== 🚀 【核心修改：合并推送注入天梯图】 ======================
         if merge_notification and (results or market_report) and not args.no_notify:
             parts = []
             if market_report:
                 parts.append(f"# 📈 大盘复盘\n\n{market_report}")
-            
-            # 自动注入生成的短线天梯图摘要
-            ladder_summary = generate_market_ladder_summary()
-            if ladder_summary:
-                parts.append(ladder_summary)
-
             if results:
                 dashboard_content = pipeline.notifier.generate_aggregate_report(
                     results, getattr(config, 'report_type', 'simple')
                 )
                 parts.append(f"# 🚀 上一交易日涨停分析\n\n{dashboard_content}")
-            
             if parts:
                 combined_content = "\n\n---\n\n".join(parts)
                 if pipeline.notifier.is_available():
                     if pipeline.notifier.send(combined_content, email_send_to_all=True, route_type="report"):
-                        logger.info("已合并推送（包含题材天梯图）")
+                        logger.info("已合并推送")
                     else:
                         logger.warning("合并推送失败")
-        # ============================================================================
 
         if results:
             logger.info("\n===== 分析结果摘要 =====")
-            for r in sorted(results, key=lambda x: x.signal_score, reverse=True):
-                emoji = r.get_emoji() if hasattr(r, 'get_emoji') else "🔍"
-                # 兼容原有属性名：将 sentiment_score 改为项目的真实属性 signal_score
-                logger.info(f"{emoji} {r.name}({r.code}): 得分 {r.signal_score}")
+            for r in sorted(results, key=lambda x: x.sentiment_score, reverse=True):
+                emoji = r.get_emoji()
+                logger.info(f"{emoji} {r.name}({r.code}): {r.operation_advice} | 评分 {r.sentiment_score}")
 
-        # 飞书文档同步模块完美保留并适配天梯图
+        logger.info("\n任务执行完成")
+
         try:
             from src.feishu_doc import FeishuDocManager
             feishu_doc = FeishuDocManager()
             if feishu_doc.is_configured() and (results or market_report):
                 tz_cn = timezone(timedelta(hours=8))
                 now = datetime.now(tz_cn)
-                doc_title = f"{now.strftime('%Y-%m-%d')} 上一交易日涨停与天梯题材分析"
+                doc_title = f"{now.strftime('%Y-%m-%d')} 上一交易日涨停分析"
                 full_content = ""
                 if market_report:
                     full_content += f"# 📈 大盘复盘\n\n{market_report}\n\n---\n\n"
-                
-                ladder_summary = generate_market_ladder_summary()
-                if ladder_summary:
-                    full_content += f"{ladder_summary}\n\n---\n\n"
-
                 if results:
                     dashboard_content = pipeline.notifier.generate_aggregate_report(
                         results, getattr(config, 'report_type', 'simple')
@@ -451,32 +437,229 @@ def start_api_server(host: str, port: int, config: Config) -> None:
         uvicorn.run("api.app:app", host=host, port=port, log_level=level_name, log_config=None)
     thread = threading.Thread(target=run_server, daemon=True)
     thread.start()
+    logger.info(f"FastAPI 服务已启动: http://{host}:{port}")
+
+def _is_truthy_env(var_name: str, default: str = "true") -> bool:
+    value = os.getenv(var_name, default).strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 def start_bot_stream_clients(config: Config) -> None:
     if config.dingtalk_stream_enabled:
         try:
             from bot.platforms import start_dingtalk_stream_background, DINGTALK_STREAM_AVAILABLE
             if DINGTALK_STREAM_AVAILABLE:
-                start_dingtalk_stream_background()
-        except Exception:
-            pass
+                if start_dingtalk_stream_background():
+                    logger.info("[Main] Dingtalk Stream client started")
+                else:
+                    logger.warning("[Main] Dingtalk Stream client failed")
+        except Exception as exc:
+            logger.error(f"[Main] Failed to start Dingtalk Stream: {exc}")
+    if getattr(config, 'feishu_stream_enabled', False):
+        try:
+            from bot.platforms import start_feishu_stream_background, FEISHU_SDK_AVAILABLE
+            if FEISHU_SDK_AVAILABLE:
+                if start_feishu_stream_background():
+                    logger.info("[Main] Feishu Stream client started")
+                else:
+                    logger.warning("[Main] Feishu Stream client failed")
+        except Exception as exc:
+            logger.error(f"[Main] Failed to start Feishu Stream: {exc}")
+
+def _resolve_scheduled_stock_codes(stock_codes: Optional[List[str]]) -> Optional[List[str]]:
+    if stock_codes is not None:
+        logger.warning("定时模式忽略--stocks，每次运行读取最新STOCK_LIST")
+    return None
+
+def _reload_runtime_config() -> Config:
+    _reload_env_file_values_preserving_overrides()
+    Config.reset_instance()
+    return get_config()
+
+def _build_schedule_time_provider(default_schedule_time: str):
+    from src.core.config_manager import ConfigManager
+    _SYSTEM_DEFAULT_SCHEDULE_TIME = "16:30"
+    manager = ConfigManager()
+    def _provider() -> str:
+        if "SCHEDULE_TIME" in _INITIAL_PROCESS_ENV:
+            return os.getenv("SCHEDULE_TIME", default_schedule_time)
+        config_map = manager.read_config_map()
+        schedule_time = (config_map.get("SCHEDULE_TIME", "") or "").strip()
+        if schedule_time:
+            return schedule_time
+        return _SYSTEM_DEFAULT_SCHEDULE_TIME
+    return _provider
 
 def main() -> int:
     args = parse_arguments()
     try:
         _setup_bootstrap_logging(debug=args.debug)
-    except Exception:
-        logging.basicConfig(level=logging.INFO)
+    except Exception as exc:
+        logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stderr)
+        logger.warning("Bootstrap日志初始化失败: %s", exc)
     try:
         config = get_config()
-    except Exception:
+    except Exception as exc:
+        logger.exception("加载配置失败: %s", exc)
         return 1
-    
-    _setup_runtime_logging(config.log_dir, debug=args.debug)
+    try:
+        _setup_runtime_logging(config.log_dir, debug=args.debug)
+    except Exception as exc:
+        logger.exception("切换日志目录失败: %s", exc)
+        return 1
 
-    if config.run_immediately:
-        run_full_analysis(config, args, None)
-    return 0
+    logger.info("=" * 60)
+    logger.info("A股自选股智能分析系统 启动")
+    logger.info(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("【已启用】自动获取上一交易日涨停（自动跳过周末/节假日并执行代码清洗）")
+    logger.info("=" * 60)
+
+    warnings = config.validate()
+    for warning in warnings:
+        logger.warning(warning)
+
+    if getattr(args, "check_notify", False):
+        from src.services.notification_diagnostics import format_notification_diagnostics, run_notification_diagnostics
+        result = run_notification_diagnostics(config)
+        print(format_notification_diagnostics(result))
+        return 0 if result.ok else 1
+
+    stock_codes = None
+    if args.stocks:
+        # 如果命令行手动指定了 --stocks，也过一遍规范化转换
+        stock_codes = [canonical_stock_code(c) for c in args.stocks.split(',') if (c or "").strip() and "ZTPOOL" not in c.upper()]
+        logger.info(f"使用命令行股票: {stock_codes}")
+
+    if args.webui:
+        args.serve = True
+    if args.webui_only:
+        args.serve_only = True
+    if config.webui_enabled and not (args.serve or args.serve_only):
+        args.serve = True
+
+    start_serve = (args.serve or args.serve_only) and os.getenv("GITHUB_ACTIONS") != "true"
+    if start_serve:
+        if args.host == '0.0.0.0' and os.getenv('WEBUI_HOST'):
+            args.host = os.getenv('WEBUI_HOST')
+        if args.port == 8000 and os.getenv('WEBUI_PORT'):
+            args.port = int(os.getenv('WEBUI_PORT'))
+
+    bot_clients_started = False
+    if start_serve:
+        if not prepare_webui_frontend_assets():
+            logger.warning("前端静态资源未就绪，Web页面可能不可用")
+        try:
+            start_api_server(host=args.host, port=args.port, config=config)
+            bot_clients_started = True
+        except Exception as e:
+            logger.error(f"启动FastAPI失败: {e}")
+    if bot_clients_started:
+        start_bot_stream_clients(config)
+
+    if args.serve_only:
+        logger.info("模式: 仅Web服务")
+        logger.info(f"运行中: http://{args.host}:{args.port}")
+        logger.info("按Ctrl+C退出")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("\n用户中断，退出")
+        return 0
+
+    try:
+        if getattr(args, 'backtest', False):
+            logger.info("模式: 回测")
+            from src.services.backtest_service import BacktestService
+            service = BacktestService()
+            stats = service.run_backtest(
+                code=args.backtest_code, force=args.backtest_force, eval_window_days=args.backtest_days
+            )
+            logger.info(f"回测完成: processed={stats.get('processed')}")
+            return 0
+
+        if args.market_review:
+            from src.core.market_review import run_market_review
+            from src.core.market_review_runtime import build_market_review_runtime
+            effective_region = None
+            if not args.force_run and config.trading_day_check_enabled:
+                from src.core.trading_calendar import get_open_markets_today, compute_effective_region
+                open_markets = get_open_markets_today()
+                effective_region = compute_effective_region(config.market_review_region or 'cn', open_markets)
+                if effective_region == '':
+                    logger.info("今日非交易日，跳过大盘复盘")
+                    return 0
+            logger.info("模式: 仅大盘复盘")
+            notifier, analyzer, search_service = build_market_review_runtime(config)
+            _run_market_review_with_shared_lock(
+                config, run_market_review, notifier=notifier, analyzer=analyzer, search_service=search_service,
+                send_notification=not args.no_notify, override_region=effective_region
+            )
+            return 0
+
+        if args.schedule or config.schedule_enabled:
+            logger.info("模式: 定时任务")
+            logger.info(f"每日执行时间: {config.schedule_time}")
+            should_run_immediately = config.schedule_run_immediately
+            if args.no_run_immediately:
+                should_run_immediately = False
+            logger.info(f"启动时立即执行: {should_run_immediately}")
+
+            from src.scheduler import run_with_schedule
+            scheduled_stock_codes = _resolve_scheduled_stock_codes(stock_codes)
+            schedule_time_provider = _build_schedule_time_provider(config.schedule_time)
+
+            def scheduled_task():
+                runtime_config = _reload_runtime_config()
+                run_full_analysis(runtime_config, args, scheduled_stock_codes)
+
+            background_tasks = []
+            if config.agent_event_monitor_enabled:
+                from src.services.alert_worker import AlertWorker
+                interval_minutes = max(1, config.agent_event_monitor_interval_minutes)
+                alert_worker = AlertWorker(config_provider=_reload_runtime_config)
+
+                def event_monitor_task():
+                    stats = alert_worker.run_once()
+                    triggered_count = stats.get("triggered", 0)
+                    if triggered_count:
+                        logger.info("[EventMonitor] 本轮触发 %d 条提醒", triggered_count)
+
+                background_tasks.append({
+                    "task": event_monitor_task,
+                    "interval_seconds": interval_minutes * 60,
+                    "run_immediately": True,
+                    "name": "agent_event_monitor",
+                })
+
+            run_with_schedule(
+                task=scheduled_task, schedule_time=config.schedule_time,
+                run_immediately=should_run_immediately, background_tasks=background_tasks,
+                schedule_time_provider=schedule_time_provider
+            )
+            return 0
+
+        if config.run_immediately:
+            run_full_analysis(config, args, stock_codes)
+        else:
+            logger.info("配置为不立即运行分析")
+
+        logger.info("\n程序执行完成")
+        keep_running = start_serve and not (args.schedule or config.schedule_enabled)
+        if keep_running:
+            logger.info("API服务运行中，按Ctrl+C退出")
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                pass
+        return 0
+
+    except KeyboardInterrupt:
+        logger.info("\n用户中断，退出")
+        return 130
+    except Exception as e:
+        logger.exception(f"程序执行失败: {e}")
+        return 1
 
 if __name__ == "__main__":
     sys.exit(main())
