@@ -3,22 +3,23 @@
 ===================================
 A股自选股智能分析系统 - 主调度程序
 ===================================
-【全天候强制发信版】保证任何时间段运行必有邮件回执 + 智能数据源校验
+【强固时区 + 强制发信补丁版】完美解决 GitHub Actions 时区造成的漏发问题
 """
 from __future__ import annotations
 
+# 🛡️ 顶级安全防护：设置硬超时，防止网络死锁
 import socket
-socket.setdefaulttimeout(6.0)
+socket.setdefaulttimeout(8.0)
 
 try:
     import urllib3
-    urllib3.util.timeout.Timeout.DEFAULT_TIMEOUT = 6.0
+    urllib3.util.timeout.Timeout.DEFAULT_TIMEOUT = 8.0
     
     import requests
     from requests.adapters import HTTPAdapter
     class TopPriorityTimeoutAdapter(HTTPAdapter):
         def __init__(self, *args, **kwargs):
-            self.timeout = 6.0
+            self.timeout = 8.0
             if "timeout" in kwargs:
                 self.timeout = kwargs["timeout"]
                 del kwargs["timeout"]
@@ -38,6 +39,7 @@ try:
 except Exception:
     pass
 
+# ==================== 标准库与核心环境加载 ====================
 import os
 import sys
 import argparse
@@ -66,29 +68,37 @@ from src.config import get_config, Config
 from src.logging_config import setup_logging
 
 logger = logging.getLogger(__name__)
-_RUNTIME_ENV_FILE_KEYS = set()
 
-# 全局变量，用来记录今天到底有没有拿到真实的涨停股票
+# 全局变量，记录运行状态
 _HAS_REAL_DYNAMIC_DATA = False
 _TARGET_DATE_STR = ""
+
+def get_beijing_time() -> datetime:
+    """获取标准的北京时间 (UTC+8)"""
+    tz_beijing = timezone(timedelta(hours=8))
+    return datetime.now(timezone.utc).astimezone(tz_beijing)
 
 def get_last_trading_day_stocks() -> list:
     global _HAS_REAL_DYNAMIC_DATA, _TARGET_DATE_STR
     try:
-        now = datetime.now()
+        # 🚨 修正：强制使用北京时间判断，不再用服务器本地时间
+        now = get_beijing_time()
+        
         if now.hour < 15:
             target_dt = now - timedelta(days=1)
         else:
             target_dt = now
 
-        if target_dt.weekday() == 5:
+        if target_dt.weekday() == 5:    
             target_dt = target_dt - timedelta(days=1)
-        elif target_dt.weekday() == 6:
+        elif target_dt.weekday() == 6:  
             target_dt = target_dt - timedelta(days=2)
 
         raw_date = target_dt.strftime("%Y-%m-%d")
+        _TARGET_DATE_STR = raw_date
         target_date = raw_date.replace("-", "").strip()
-        _TARGET_DATE_STR = target_date
+        
+        logger.info(f"⏰ 当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info(f"📅 策略最终向 AkShare 发起请求的目标日期：【{target_date}】")
 
         try:
@@ -100,7 +110,7 @@ def get_last_trading_day_stocks() -> list:
         if df is not None and not df.empty:
             code_col = "代码" if "代码" in df.columns else "code"
             lbc_col = "连续涨停天数" if "连续涨停天数" in df.columns else "fbs"  
-            fbsj_col = "停板时间" if "停板时间" in df.columns else "fbt" 
+            fbsj_col = "最后封板时间" if "最后封板时间" in df.columns else "fbt" 
             
             if code_col in df.columns:
                 df[code_col] = df[code_col].astype(str).str.strip()
@@ -128,35 +138,13 @@ def get_last_trading_day_stocks() -> list:
                 final_30 = raw_list[:30]
                 if final_30:
                     _HAS_REAL_DYNAMIC_DATA = True
-                    logger.info(f"✅ 成功清洗排序！截取核心【龙头30强】。")
+                    logger.info(f"✅ 成功获取动态涨停数据，截取核心【龙头30强】标的。")
                     return final_30
 
         return []
     except Exception as e:
         logger.error(f"❌ 运行 get_last_trading_day_stocks 遭遇异常: {e}")
         return []
-
-def _get_active_env_path() -> Path:
-    env_file = os.getenv("ENV_FILE")
-    if env_file:
-        return Path(env_file)
-    return Path(__file__).resolve().parent / ".env"
-
-def _read_active_env_values() -> Optional[Dict[str, str]]:
-    env_path = _get_active_env_path()
-    if not env_path.exists():
-        return {}
-    try:
-        values = dotenv_values(env_path)
-    except Exception as exc:
-        logger.warning("读取配置文件 %s 失败: %s", env_path, exc)
-        return None
-    return {str(key): "" if value is None else str(value) for key, value in values.items() if key is not None}
-
-_ACTIVE_ENV_FILE_VALUES = _read_active_env_values() or {}
-_RUNTIME_ENV_FILE_KEYS = {key for key in _ACTIVE_ENV_FILE_VALUES if key not in _INITIAL_PROCESS_ENV}
-
-_env_bootstrapped = True
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='A股自选股智能分析系统')
@@ -192,6 +180,11 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
     global _HAS_REAL_DYNAMIC_DATA, _TARGET_DATE_STR
     from src.core.market_review import run_market_review
     from src.core.pipeline import StockAnalysisPipeline
+    
+    pipeline_instance = None
+    market_report = ""
+    results = []
+    
     try:
         if stock_codes is None:
             config.refresh_stock_list()
@@ -211,76 +204,80 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
             effective_codes = [c for c in config.stock_list if str(c).startswith(('60', '00', '30'))][:30]
         
         config.stock_list = effective_codes  
-        logger.info(f"🎯 最终参与推演分析的股票数: {len(effective_codes)} 只")
 
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(config, args, effective_codes)
-        if should_skip:
-            logger.info("今日非交易日，跳过执行")
-            return
-        stock_codes = filtered_codes
-
-        merge_notification = getattr(config, 'merge_email_notification', False) and config.market_review_enabled and not getattr(args, 'no_market_review', False)
-
-        workers = args.workers if args.workers is not None else 5
         
-        pipeline = StockAnalysisPipeline(
+        # 🚀 提速：并发数提升至 5
+        workers = args.workers if args.workers is not None else 5
+        pipeline_instance = StockAnalysisPipeline(
             config=config, max_workers=workers, query_id=uuid.uuid4().hex,
             query_source="cli", save_context_snapshot=False
         )
 
-        results = []
-        try:
-            results = pipeline.run(stock_codes=stock_codes, dry_run=args.dry_run, send_notification=not args.no_notify, merge_notification=merge_notification)
-        except Exception as pipeline_err:
-            logger.error(f"⚠️ 流水线部分个股遭遇阻碍: {pipeline_err}")
+        if should_skip:
+            logger.info("今日非交易日，触发安全跳过，直接进入邮件回执阶段")
+        else:
+            stock_codes = filtered_codes
+            merge_notification = getattr(config, 'merge_email_notification', False) and config.market_review_enabled and not getattr(args, 'no_market_review', False)
 
-        market_report = ""
-        if config.market_review_enabled and not args.no_market_review and effective_region != '':
             try:
-                from src.core.market_review_lock import try_acquire_market_review_lock, release_market_review_lock
-                lock_token = try_acquire_market_review_lock(config)
-                if lock_token:
-                    try:
-                        market_report = run_market_review(
-                            notifier=pipeline.notifier, analyzer=pipeline.analyzer, search_service=pipeline.search_service,
-                            send_notification=not args.no_notify, merge_notification=merge_notification, override_region=effective_region
-                        ) or ""
-                    finally:
-                        release_market_review_lock(lock_token)
-            except Exception as review_err:
-                logger.error(f"⚠️ 大盘复盘接口异常: {review_err}")
+                results = pipeline_instance.run(stock_codes=stock_codes, dry_run=args.dry_run, send_notification=not args.no_notify, merge_notification=merge_notification)
+            except Exception as pipeline_err:
+                logger.error(f"⚠️ 流水线执行中遭遇部分阻碍: {pipeline_err}")
 
-        # 🔔 ====== 🌟 核心修改：全天候强制发信逻辑 🌟 ======
-        if not args.no_notify:
+            if config.market_review_enabled and not args.no_market_review and effective_region != '':
+                try:
+                    from src.core.market_review_lock import try_acquire_market_review_lock, release_market_review_lock
+                    lock_token = try_acquire_market_review_lock(config)
+                    if lock_token:
+                        try:
+                            market_report = run_market_review(
+                                notifier=pipeline_instance.notifier, analyzer=pipeline_instance.analyzer, search_service=pipeline_instance.search_service,
+                                send_notification=not args.no_notify, merge_notification=merge_notification, override_region=effective_region
+                            ) or ""
+                        finally:
+                            release_market_review_lock(lock_token)
+                except Exception as review_err:
+                    logger.error(f"⚠️ 大盘复盘接口异常: {review_err}")
+
+    except Exception as e:
+        logger.exception(f"分析流程前置环节执行失败: {e}")
+
+    # 🔔 ====== 🌟 强制发信兜底逻辑：挪到最外层，排除任何 return 中断 🌟 ======
+    if not args.no_notify:
+        # 如果前面发生意外没初始化好 pipeline，这里紧急补救一个通知器
+        if pipeline_instance is None:
+            try:
+                pipeline_instance = StockAnalysisPipeline(config=config, max_workers=1, query_id=uuid.uuid4().hex, query_source="cli", save_context_snapshot=False)
+            except Exception:
+                pass
+                
+        if pipeline_instance and pipeline_instance.notifier and pipeline_instance.notifier.is_available():
             parts = []
+            now_bj = get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')
+            parts.append(f"⏱️ **回执快报**：程序于北京时间 `[{now_bj}]` 运行完毕。")
             
-            # 如果没有成功获取到当天的涨停池，加上友情提示头
             if not _HAS_REAL_DYNAMIC_DATA:
-                parts.append(f"⚠️ **【系统提示】当前运行时间处于非交易时段或清晨数据维护期。程序未能从数据源中获取到目标日期【{_TARGET_DATE_STR}】的实时涨停股，已自动切换为分析您自选股中的标的。**\n\n---")
-
+                parts.append(f"⚠️ **提示**：未获取到目标日 `[{_TARGET_DATE_STR}]` 的实时涨停池，已自动为您转向默认标的。")
+            
             if market_report:
                 parts.append(f"# 📈 大盘复盘\n\n{market_report}")
             if results:
-                dashboard_content = pipeline.notifier.generate_aggregate_report(results, getattr(config, 'report_type', 'simple'))
-                parts.append(f"# 🚀 涨停板智能推演分析报告\n\n{dashboard_content}")
-            
-            if not parts or (len(parts) == 1 and not _HAS_REAL_DYNAMIC_DATA):
-                parts.append(f"# 📌 智能分析流水线提示\n\n今日未触发有效的个股或大盘数据（可能处于非交易时段维护），流水线空跑收尾成功。目标日期：{_TARGET_DATE_STR}")
+                dashboard_content = pipeline_instance.notifier.generate_aggregate_report(results, getattr(config, 'report_type', 'simple'))
+                parts.append(f"# 🚀 智能推演分析报告\n\n{dashboard_content}")
+                
+            if len(parts) <= 2 and not results and not market_report:
+                parts.append(f"# 📌 流水线状态提示\n\n当前时段未捕获到新增的推演个股或复盘报告，流水线安全空跑收尾。目标日期: {_TARGET_DATE_STR}")
                 
             combined_content = "\n\n---\n\n".join(parts)
-            
-            if pipeline.notifier.is_available():
-                logger.info("📧 正在向指定邮箱强行派发推演汇总回执邮件...")
-                try:
-                    pipeline.notifier.send(combined_content, email_send_to_all=True, route_type="report")
-                    logger.info("✅ 邮件投递成功。")
-                except Exception as mail_err:
-                    logger.error(f"❌ SMTP 邮件服务投递失败: {mail_err}")
-            else:
-                logger.warning("⚠️ 通知组件 notifier 处于不可用状态，请检查环境变量配置！")
-
-    except Exception as e:
-        logger.exception(f"分析流程执行失败: {e}")
+            logger.info("📧 正在向指定邮箱派发全天候强制汇总回执邮件...")
+            try:
+                pipeline_instance.notifier.send(combined_content, email_send_to_all=True, route_type="report")
+                logger.info("✅ 邮件成功投递至 SMTP 协议栈。")
+            except Exception as mail_err:
+                logger.error(f"❌ SMTP 邮件投递失败: {mail_err}")
+        else:
+            logger.warning("⚠️ 通知组件不可用，请检查 .env 的邮箱变量配置！")
 
 def main() -> int:
     args = parse_arguments()
