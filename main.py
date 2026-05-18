@@ -3,7 +3,7 @@
 ===================================
 A股自选股智能分析系统 - 主调度程序
 ===================================
-【量化打通版】直接集成 AkShare 涨停板本地抓取逻辑，彻底根除 ZTPOOL / 空数据问题
+【量化打通版】集成 AkShare 涨停板本地抓取逻辑，彻底修复 Actions 报错与 ZTPOOL 问题
 """
 from __future__ import annotations
 
@@ -65,22 +65,19 @@ def get_last_trading_day_stocks() -> list:
             trade_days = [date.strftime("%Y%m%d") for date in schedule.index]
             # 如果今天还没收盘（15点前），或者今天本身不是交易日，则取上一个已经收盘的交易日
             if now.hour < 15 or now.strftime("%Y%m%d") not in trade_days:
-                # 剔除今天，取最后一个已完成的交易日
                 past_days = [d for d in trade_days if d < now.strftime("%Y%m%d")]
                 target_date = past_days[-1] if past_days else trade_days[-1]
             else:
-                # 今天是交易日且已经收盘
                 target_date = now.strftime("%Y%m%d")
 
         logger.info(f"📅 系统自动锁定的分析基准交易日为：【{target_date}】")
 
-        # 2. 调用你的 AkShare 核心涨停板抓取逻辑
+        # 2. 调用 AkShare 核心涨停板抓取逻辑
         logger.info(f"🚀 正在通过 AkShare 动态提取 {target_date} 全市场涨停池...")
         df = ak.stock_zt_pool_em(date=target_date)
         
         stock_list = []
         if df is not None and not df.empty:
-            # 兼容处理：支持“代码”或重命名后的“code”列
             code_col = "代码" if "代码" in df.columns else "code"
             for c in df[code_col].tolist():
                 c_str = str(c).strip()
@@ -279,12 +276,11 @@ def run_full_analysis(
         if stock_codes is None:
             config.refresh_stock_list()
 
-        # ====================== 🚀 【核心清洗替换逻辑】 ======================
+        # ====================== 🚀 核心替换逻辑 ======================
         limit_up_stocks = get_last_trading_day_stocks()
         if limit_up_stocks:
             sanitized_stocks = []
             for c in limit_up_stocks:
-                # 严格拦截剔除可能混入的 ZTPOOL 伪代码
                 if not c or "ZTPOOL" in str(c).upper():
                     continue
                 try:
@@ -296,11 +292,10 @@ def run_full_analysis(
             
             if sanitized_stocks:
                 effective_codes = sanitized_stocks
-                config.stock_list = sanitized_stocks  # 强制刷新配置，洗掉旧的 ZTPOOL 占位符
+                config.stock_list = sanitized_stocks  
                 logger.info(f"🎯 真实涨停股成功对接流水线（共 {len(effective_codes)} 只）")
             else:
                 effective_codes = [c for c in config.stock_list if "ZTPOOL" not in str(c).upper()]
-                logger.warning("⚠️ 规范化清洗后无有效A股代码，自动降级使用系统默认自选股")
         else:
             effective_codes = [c for c in config.stock_list if "ZTPOOL" not in str(c).upper()]
             logger.info(f"📌 未捕获到动态涨停，继续使用配置自选股：{len(effective_codes)} 只")
@@ -338,7 +333,6 @@ def run_full_analysis(
             send_notification=not args.no_notify, merge_notification=merge_notification
         )
 
-        # 安全清洗返回结果
         if results:
             results = [r for r in results if r and hasattr(r, 'code') and "ZTPOOL" not in str(r.code).upper()]
 
@@ -402,15 +396,6 @@ def run_full_analysis(
 
     except Exception as e:
         logger.exception(f"分析流程执行失败: {e}")
-
-def start_api_server(host: str, port: int, config: Config) -> None:
-    import threading
-    import uvicorn
-    def run_server():
-        level_name = (config.log_level or "INFO").lower()
-        uvicorn.run("api.app:app", host=host, port=port, log_level=level_name, log_config=None)
-    thread = threading.Thread(target=run_server, daemon=True)
-    thread.start()
 
 def main() -> int:
     args = parse_arguments()
