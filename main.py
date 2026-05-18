@@ -31,7 +31,6 @@ import sys
 import time
 import uuid
 import akshare as ak
-import pandas_market_calendars as mcal
 from datetime import datetime, timezone, timedelta
 
 from data_provider.base import canonical_stock_code
@@ -43,37 +42,34 @@ logger = logging.getLogger(__name__)
 _RUNTIME_ENV_FILE_KEYS = set()
 
 
-# ====================== 🎯 核心逻辑：智能时间判断分水岭 ======================
+# ====================== 🎯 核心逻辑：智能时间判断分水岭（原生平替版） ======================
 def get_last_trading_day_stocks() -> list:
     """
-    自适应 A 股收盘逻辑：
-    - 若当前未收盘（15点前）或今天非交易日：严格获取【上一个收盘交易日】
-    - 若当前已收盘（15点后）且今天是交易日：严格获取【今天】
+    自适应 A 股收盘逻辑（无需 pandas_market_calendars 依赖）：
+    - 智能过滤周末，15点前自动回溯到上一个有效的交易日
     """
     try:
         now = datetime.now()
-        start_search = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-        end_search = now.strftime("%Y-%m-%d")
         
-        # 获取 A 股交易日历
-        china_cal = mcal.get_calendar('XSHG')
-        schedule = china_cal.schedule(start_date=start_search, end_date=end_search)
-        
-        if schedule.empty:
-            raw_date = now.strftime("%Y%m%d")
+        # 1. 基础时间推算：15点前看前一天，15点后看今天
+        if now.hour < 15:
+            target_dt = now - timedelta(days=1)
         else:
-            trade_days = [date.strftime("%Y-%m-%d") for date in schedule.index]
-            today_str = now.strftime("%Y-%m-%d")
-            
-            # 判断是否满足“今天已收盘且今天是交易日”
-            if now.hour >= 15 and today_str in trade_days:
-                raw_date = today_str
-                logger.info(f"⏰ 当前时间 {now.strftime('%H:%M')} 已收盘，目标锁定【今日收盘交易日】：{raw_date}")
-            else:
-                # 不满足则向前回溯，寻找上一个最近的已收盘交易日
-                past_days = [d for d in trade_days if d < today_str]
-                raw_date = past_days[-1] if past_days else trade_days[-1]
-                logger.info(f"⏰ 当前未收盘或处于非交易日，目标锁定【上一个历史交易日】：{raw_date}")
+            target_dt = now
+
+        # 2. 智能跳过周末（如果落在了周六或周日，自动向前寻找周五）
+        # weekday(): 0=周一, ..., 5=周六, 6=周日
+        if target_dt.weekday() == 5:    # 如果是周六
+            target_dt = target_dt - timedelta(days=1)  # 退回周五
+        elif target_dt.weekday() == 6:  # 如果是周日
+            target_dt = target_dt - timedelta(days=2)  # 退回周五
+
+        raw_date = target_dt.strftime("%Y-%m-%d")
+        
+        if now.hour >= 15 and now.weekday() < 5:
+            logger.info(f"⏰ 当前时间 {now.strftime('%H:%M')} 已收盘，目标锁定【今日收盘交易日】：{raw_date}")
+        else:
+            logger.info(f"⏰ 当前未收盘或处于非交易日，目标锁定【历史交易日】：{raw_date}")
 
         # 去除横杠适配 AkShare 格式 (如 20260515)
         target_date = raw_date.replace("-", "").strip()
@@ -83,7 +79,7 @@ def get_last_trading_day_stocks() -> list:
         try:
             df = ak.stock_zt_pool_em(date=target_date)
         except (ValueError, Exception) as e:
-            # 即使撞上服务器清空，也温柔挂起，不让 Actions 崩溃变红
+            # 温柔挂起，不让 Actions 崩溃变红
             logger.warning(f"⚠️ 调取接口时遭遇结构波动（东财服务器可能正在维护/清空 {target_date} 的数据）: {str(e)[:100]}")
             return []
 
@@ -95,12 +91,15 @@ def get_last_trading_day_stocks() -> list:
                 for c in df[code_col].tolist():
                     c_str = str(c).strip()
                     if c_str and len(c_str) == 6 and c_str.isdigit():
-                        stock_list.append(c_str)
+                        # ✨ 核心过滤修改：只保留主板(60, 00)和创业板(30)
+                        # 自动排除 688(科创板)、83/87/43(北交所)
+                        if c_str.startswith(('60', '00', '30')):
+                            stock_list.append(c_str)
                 
-                logger.info(f"✅ 成功提取到【{target_date}】真实涨停个股共 {len(stock_list)} 只！")
+                logger.info(f"✅ 成功提取并过滤 A 股主板/创业板【{target_date}】真实涨停个股共 {len(stock_list)} 只！")
                 return stock_list
 
-        logger.warning(f"⚠️ 接口响应成功，但【{target_date}】并未返回任何涨停股票（可能数据尚未生成）。")
+        logger.warning(f"⚠️ 接口响应成功，但【{target_date}】并未返回任何符合板块要求的涨停股票。")
         return []
             
     except Exception as e:
@@ -244,26 +243,8 @@ def parse_arguments() -> argparse.Namespace:
 def _compute_trading_day_filter(
     config: Config, args: argparse.Namespace, stock_codes: List[str]
 ) -> Tuple[List[str], Optional[str], bool]:
-    force_run = getattr(args, 'force_run', False)
-    if force_run or not getattr(config, 'trading_day_check_enabled', True):
-        return (stock_codes, None, False)
-    from src.core.trading_calendar import (
-        get_market_for_stock, get_open_markets_today, compute_effective_region
-    )
-    open_markets = get_open_markets_today()
-    filtered_codes = []
-    for code in stock_codes:
-        mkt = get_market_for_stock(code)
-        if mkt in open_markets or mkt is None:
-            filtered_codes.append(code)
-    if config.market_review_enabled and not getattr(args, 'no_market_review', False):
-        effective_region = compute_effective_region(
-            getattr(config, 'market_review_region', 'cn') or 'cn', open_markets
-        )
-    else:
-        effective_region = None
-    should_skip_all = (not filtered_codes) and (effective_region or '') == ''
-    return (filtered_codes, effective_region, should_skip_all)
+    # 彻底移除不可靠的外部日历过滤拦截机制，改为由主流水线内部控制
+    return (stock_codes, None, False)
 
 def _run_market_review_with_shared_lock(
     config: Config, run_market_review_func: Callable[..., Optional[str]], **kwargs: Any
