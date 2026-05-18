@@ -3,12 +3,11 @@
 ===================================
 A股自选股智能分析系统 - 主调度程序
 ===================================
-【零依赖原生分水岭版 + 顶级网络熔断补丁】彻底解决 ModuleNotFoundError 与 30分钟卡死挂起
+【主板+创业板 顶级精选30只版】严格兼顾60/00/30 + 连板龙头优先筛选 + 顶级网络熔断防护
 """
 from __future__ import annotations
 
-# 🛡️ 绝杀点 1：必须在整个脚本的最顶端（任何 import 之前）强行注入网络硬超时约束
-# 确保所有第三方库（如 akshare, requests, urllib3）诞生之初就带有超时基因
+# 🛡️ 顶级安全防护：必须在整个脚本的最顶端（任何 import 之前）强行注入网络硬超时约束
 import socket
 socket.setdefaulttimeout(8.0)
 
@@ -30,7 +29,7 @@ try:
                 kwargs["timeout"] = self.timeout
             return super().send(request, **kwargs)
             
-    # 在任何人使用 Session 之前抢先劫持
+    # 在任何人使用 Session 之前抢先劫持，全面拦截跨境长连接挂起
     _old_session_init = requests.Session.__init__
     def _patched_session_init(self, *args, **kwargs):
         _old_session_init(self, *args, **kwargs)
@@ -64,7 +63,7 @@ if os.getenv("GITHUB_ACTIONS") != "true" and os.getenv("USE_PROXY", "false").low
     os.environ["http_proxy"] = proxy_url
     os.environ["https_proxy"] = proxy_url
 
-# 延迟导入大型第三方库，确保上面的猴子补丁完全生效
+# 延迟导入大型第三方库，确保上面的熔断补丁完全生效
 import akshare as ak
 from data_provider.base import canonical_stock_code
 from src.webui_frontend import prepare_webui_frontend_assets
@@ -75,12 +74,13 @@ logger = logging.getLogger(__name__)
 _RUNTIME_ENV_FILE_KEYS = set()
 
 
-# ====================== 🎯 核心逻辑：智能时间判断分水岭（免外部日历依赖版） ======================
+# ====================== 🎯 核心逻辑：智能时间判断分水岭（精选前30支龙头） ======================
 def get_last_trading_day_stocks() -> list:
     """
-    自适应 A 股收盘逻辑（完全原生实现，不依赖 pandas_market_calendars）：
+    自适应 A 股收盘逻辑：
     - 若当前未收盘（15点前）或今天非交易日：严格获取【上一个收盘交易日】
     - 若当前已收盘（15点后）且今天是交易日：严格获取【今天】
+    💡 核心过滤：包含主板(60/00)与创业板(30)，按连板天数及封板时间排序，精准截取前30只最具代表性的龙头。
     """
     try:
         now = datetime.now()
@@ -114,22 +114,46 @@ def get_last_trading_day_stocks() -> list:
             logger.warning(f"⚠️ 调取动态涨停池网络遭遇阻碍（东财接口限流或跨境网络波动）: {str(e)[:100]}")
             return []
 
-        # 解析清洗代码
-        stock_list = []
         if df is not None and not df.empty:
+            # 兼容东财不同时期的列名波动
             code_col = "代码" if "代码" in df.columns else "code"
+            lbc_col = "连续涨停天数" if "连续涨停天数" in df.columns else "fbs"  # 连板数
+            fbsj_col = "最后封板时间" if "最后封板时间" in df.columns else "fbt" # 封板时间
+            
             if code_col in df.columns:
-                for c in df[code_col].tolist():
-                    c_str = str(c).strip()
-                    if c_str and len(c_str) == 6 and c_str.isdigit():
-                        # 过滤非主板、非创业板股票
-                        if c_str.startswith(('60', '00', '30')):
-                            stock_list.append(c_str)
+                # 1. 过滤：只保留主板(60/00)和创业板(30)
+                df[code_col] = df[code_col].astype(str).str.strip()
+                df = df[df[code_col].str.startswith(('60', '00', '30'))].copy()
                 
-                logger.info(f"✅ 成功清洗并提取 A 股真实涨停个股共 {len(stock_list)} 只！")
-                return stock_list
+                # 2. 智能排序优化（若存在排序所需的列）
+                # 连续涨停天数转为数值用于降序排，最后封板时间升序排（先封板的靠前）
+                sort_cols = []
+                sort_ascending = []
+                
+                if lbc_col in df.columns:
+                    df[lbc_col] = sys.float_info.min  # 默认兜底
+                    try:
+                        df[lbc_col] = df[lbc_col].astype(str).str.extract(r'(\d+)').astype(float)
+                    except Exception:
+                        pass
+                    sort_cols.append(lbc_col)
+                    sort_ascending.append(False) # 连板天数：大到小
+                    
+                if fbsj_col in df.columns:
+                    sort_cols.append(fbsj_col)
+                    sort_ascending.append(True)  # 封板时间：早到晚
+                    
+                if sort_cols:
+                    df = df.sort_values(by=sort_cols, ascending=sort_ascending)
+                
+                # 3. 截取前 30 支股票
+                raw_list = df[code_col].tolist()
+                final_30 = raw_list[:30]
+                
+                logger.info(f"✅ 成功清洗排序！原始涨停总数 {len(raw_list)} 只，已为您截取前排核心【龙头30强】标的。")
+                return final_30
 
-        logger.warning(f"⚠️ 接口响应成功，但【{target_date}】并未返回任何符合条件的股票。")
+        logger.warning(f"⚠️ 接口响应成功，但【{target_date}】并未返回任何符合板块要求的涨停股票。")
         return []
             
     except Exception as e:
@@ -295,7 +319,7 @@ def _compute_trading_day_filter(
         should_skip_all = (not filtered_codes) and (effective_region or '') == ''
         return (filtered_codes, effective_region, should_skip_all)
     except Exception as e:
-        logger.warning(f"⚠️ 交易日历接口超时或网络受限，自动切换为安全放行模式: {e}")
+        logger.warning(f"⚠️ 交易日历接口超时，自动切换为安全放行模式: {e}")
         return (stock_codes, "cn", False)
 
 def _run_market_review_with_shared_lock(
@@ -322,7 +346,7 @@ def run_full_analysis(
         if stock_codes is None:
             config.refresh_stock_list()
 
-        # ====================== 🚀 对接智能时间清洗 ======================
+        # ====================== 🚀 对接智能精选涨停池 ======================
         limit_up_stocks = get_last_trading_day_stocks()
         if limit_up_stocks:
             sanitized_stocks = []
@@ -332,19 +356,21 @@ def run_full_analysis(
                 try:
                     std_code = canonical_stock_code(str(c).strip())
                     if std_code and "ZTPOOL" not in std_code.upper():
-                        sanitized_stocks.append(std_code)
+                        # 支持主板(60/00)和创业板(30)
+                        if std_code.startswith(('60', '00', '30')):
+                            sanitized_stocks.append(std_code)
                 except Exception as e:
                     logger.warning(f"⚠️ 代码 {c} 规范化清洗失败: {e}")
             
             if sanitized_stocks:
-                effective_codes = sanitized_stocks
-                config.stock_list = sanitized_stocks  
-                logger.info(f"🎯 真实涨停股成功录入智能分析流水线（共 {len(effective_codes)} 只）")
+                effective_codes = sanitized_stocks[:30] # 严格切片前30支
+                config.stock_list = effective_codes  
+                logger.info(f"🎯 核心【主板+创业板 30强】成功录入智能推演流水线！")
             else:
-                effective_codes = [c for c in config.stock_list if "ZTPOOL" not in str(c).upper()]
+                effective_codes = [c for c in config.stock_list if str(c).startswith(('60', '00', '30'))][:30]
         else:
-            effective_codes = [c for c in config.stock_list if "ZTPOOL" not in str(c).upper()]
-            logger.info(f"📌 当前时段无动态涨停池，自动降级分析默认自选股（共 {len(effective_codes)} 只）")
+            effective_codes = [c for c in config.stock_list if str(c).startswith(('60', '00', '30'))][:30]
+            logger.info(f"📌 当前时段无可用动态数据，自动截取自选股中前30支标的（共 {len(effective_codes)} 只）")
         # ====================================================================
 
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
@@ -370,7 +396,7 @@ def run_full_analysis(
             save_context_snapshot = False
         query_id = uuid.uuid4().hex
         
-        # 将并发控制在 2，防止高频触发国内防抓取节点拉黑
+        # 并发数保持为 2 确保稳定
         workers = args.workers if args.workers is not None else 2
         
         pipeline = StockAnalysisPipeline(
@@ -384,7 +410,7 @@ def run_full_analysis(
         )
 
         if Bag := results:
-            results = [r for r in results if r and hasattr(r, 'code') and "ZTPOOL" not in str(r.code).upper()]
+            results = [r for r in results if r and hasattr(r, 'code') and str(r.code).startswith(('60', '00', '30'))]
 
         market_report = ""
         if (
