@@ -189,7 +189,7 @@ jobs:
 
           LLM_MINIMAX_PROTOCOL: ${{ vars.LLM_MINIMAX_PROTOCOL || secrets.LLM_MINIMAX_PROTOCOL }}
           LLM_MINIMAX_BASE_URL: ${{ vars.LLM_MINIMAX_BASE_URL || secrets.LLM_MINIMAX_BASE_URL }}
-          LLM_MINIMAX_API_KEY: ${{ secrets.LLM_MINIMAX_API_KEY }}  # ✅ 已修复：去除了残留的 "rm" 语法错误
+          LLM_MINIMAX_API_KEY: ${{ secrets.LLM_MINIMAX_API_KEY }}
           LLM_MINIMAX_API_KEYS: ${{ secrets.LLM_MINIMAX_API_KEYS }}
           LLM_MINIMAX_MODELS: ${{ vars.LLM_MINIMAX_MODELS || secrets.LLM_MINIMAX_MODELS }}
           LLM_MINIMAX_ENABLED: ${{ vars.LLM_MINIMAX_ENABLED || secrets.LLM_MINIMAX_ENABLED }}
@@ -296,15 +296,23 @@ jobs:
           echo "=========================================="
           echo "📊 任务收尾与日志回放"
           echo "=========================================="
+          
           if [ -d "reports" ] && [ "$(ls -A reports 2>/dev/null)" ]; then
             echo "生成的离线报告文件列表:"
             ls -la reports/
           else
             echo "⚠️ 未生成离线报告（可能通过第三方通道直接实时推送）"
           fi
+          
           echo ""
-          # ✅ 已优化：直接用通配符匹配最新的本地日志，避开系统时区不合导致匹配失败的问题
+          
+          # ✅ 加上 || true 兜底，防止日志文件为空或 tail 命令异常导致 Actions 误判报错
           if [ -d "logs" ] && [ "$(ls -A logs 2>/dev/null)" ]; then
             echo "📜 任务执行详细回放（最后 30 行）:"
-            tail -30 logs/*.log 2>/dev/null
+            tail -30 logs/*.log 2>/dev/null || true
+          else
+            echo "ℹ Cort: 未检测到本地日志文件。"
           fi
+          
+          # ✅ 强行返回 0，确保收尾步骤绝对安全，不影响整体状态
+          exit 0
