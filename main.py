@@ -3,58 +3,56 @@
 ===================================
 A股自选股智能分析系统 - 主调度程序
 ===================================
-【智能分水岭原生版 + 全局底层网络熔断】彻底根治 GitHub Actions 30分钟超时卡死问题
+【零依赖原生分水岭版 + 顶级网络熔断补丁】彻底解决 ModuleNotFoundError 与 30分钟卡死挂起
 """
 from __future__ import annotations
 
-import os
-import sys
+# 🛡️ 绝杀点 1：必须在整个脚本的最顶端（任何 import 之前）强行注入网络硬超时约束
+# 确保所有第三方库（如 akshare, requests, urllib3）诞生之初就带有超时基因
 import socket
+socket.setdefaulttimeout(8.0)
 
-# 🛡️ 核心防护 1：设置全局底层 Socket 默认超时，防止任何原生网络连接无限期死等
-socket.setdefaulttimeout(10.0)
-
-# 🛡️ 核心防护 2：利用猴子补丁（Monkey Patch）强制约束 requests 和 urllib3 的默认超时
-# 许多第三方金融库（如 AkShare 内部调用的接口）如果没有显式传 timeout，会用 urllib3 的默认值（即无限等待）
 try:
     import urllib3
-    from urllib3.util import Timeout
-    # 强制将 urllib3 的默认连接和读取超时限制在 10 秒以内
-    urllib3.util.timeout.Timeout.DEFAULT_TIMEOUT = 10.0
+    urllib3.util.timeout.Timeout.DEFAULT_TIMEOUT = 8.0
     
-    # 针对新版 requests 底层的 HTTPAdapter 进行全局默认超时拦截
     import requests
     from requests.adapters import HTTPAdapter
-    class TimeoutHTTPAdapter(HTTPAdapter):
+    class TopPriorityTimeoutAdapter(HTTPAdapter):
         def __init__(self, *args, **kwargs):
-            self.timeout = 10.0
+            self.timeout = 8.0
             if "timeout" in kwargs:
                 self.timeout = kwargs["timeout"]
                 del kwargs["timeout"]
             super().__init__(*args, **kwargs)
         def send(self, request, **kwargs):
-            timeout = kwargs.get("timeout")
-            if timeout is None:
+            if kwargs.get("timeout") is None:
                 kwargs["timeout"] = self.timeout
             return super().send(request, **kwargs)
             
-    # 全局复写 requests 的 session 行为
-    old_session = requests.Session
-    class DefaultTimeoutSession(old_session):
-        def __init__(self):
-            super().__init__()
-            adapter = TimeoutHTTPAdapter(timeout=10.0)
-            self.mount("http://", adapter)
-            self.mount("https://", adapter)
-    requests.Session = DefaultTimeoutSession
+    # 在任何人使用 Session 之前抢先劫持
+    _old_session_init = requests.Session.__init__
+    def _patched_session_init(self, *args, **kwargs):
+        _old_session_init(self, *args, **kwargs)
+        adapter = TopPriorityTimeoutAdapter()
+        self.mount("http://", adapter)
+        self.mount("https://", adapter)
+    requests.Session.__init__ = _patched_session_init
 except Exception:
     pass
 
+# ==================== 标准库与核心环境加载 ====================
+import os
+import sys
+import argparse
+import logging
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
 from dotenv import dotenv_values
-from src.config import setup_env
 
+from src.config import setup_env
 _INITIAL_PROCESS_ENV = dict(os.environ)
 setup_env()
 
@@ -66,12 +64,8 @@ if os.getenv("GITHUB_ACTIONS") != "true" and os.getenv("USE_PROXY", "false").low
     os.environ["http_proxy"] = proxy_url
     os.environ["https_proxy"] = proxy_url
 
-import argparse
-import logging
-import uuid
+# 延迟导入大型第三方库，确保上面的猴子补丁完全生效
 import akshare as ak
-from datetime import datetime, timezone, timedelta
-
 from data_provider.base import canonical_stock_code
 from src.webui_frontend import prepare_webui_frontend_assets
 from src.config import get_config, Config
@@ -81,10 +75,10 @@ logger = logging.getLogger(__name__)
 _RUNTIME_ENV_FILE_KEYS = set()
 
 
-# ====================== 🎯 核心逻辑：智能时间判断分水岭（原生平替版） ======================
+# ====================== 🎯 核心逻辑：智能时间判断分水岭（免外部日历依赖版） ======================
 def get_last_trading_day_stocks() -> list:
     """
-    自适应 A 股收盘逻辑（免外部日历依赖版）：
+    自适应 A 股收盘逻辑（完全原生实现，不依赖 pandas_market_calendars）：
     - 若当前未收盘（15点前）或今天非交易日：严格获取【上一个收盘交易日】
     - 若当前已收盘（15点后）且今天是交易日：严格获取【今天】
     """
@@ -97,10 +91,10 @@ def get_last_trading_day_stocks() -> list:
         else:
             target_dt = now
 
-        # weekday(): 0=周一, ..., 5=周六, 6=周日
-        if target_dt.weekday() == 5:    # 周六退回周五
+        # weekday(): 0=周一, 1=周二, ..., 5=周六, 6=周日
+        if target_dt.weekday() == 5:    # 周六则安全退回周五
             target_dt = target_dt - timedelta(days=1)
-        elif target_dt.weekday() == 6:  # 周日退回周五
+        elif target_dt.weekday() == 6:  # 周日则安全退回周五
             target_dt = target_dt - timedelta(days=2)
 
         raw_date = target_dt.strftime("%Y-%m-%d")
@@ -108,7 +102,7 @@ def get_last_trading_day_stocks() -> list:
         if now.hour >= 15 and now.weekday() < 5:
             logger.info(f"⏰ 当前时间 {now.strftime('%H:%M')} 已收盘，目标锁定【今日收盘交易日】：{raw_date}")
         else:
-            logger.info(f"⏰ 当前未收盘或处于周末，目标锁定【历史交易日】：{raw_date}")
+            logger.info(f"⏰ 当前未收盘或处于非交易时段，目标锁定【历史收盘交易日】：{raw_date}")
 
         target_date = raw_date.replace("-", "").strip()
         logger.info(f"📅 策略最终向 AkShare 发起请求的目标日期：【{target_date}】")
@@ -117,7 +111,7 @@ def get_last_trading_day_stocks() -> list:
         try:
             df = ak.stock_zt_pool_em(date=target_date)
         except (ValueError, Exception) as e:
-            logger.warning(f"⚠️ 调取接口时遭遇结构波动（东财服务器可能正在维护或跨境网络超时）: {str(e)[:100]}")
+            logger.warning(f"⚠️ 调取动态涨停池网络遭遇阻碍（东财接口限流或跨境网络波动）: {str(e)[:100]}")
             return []
 
         # 解析清洗代码
@@ -128,14 +122,14 @@ def get_last_trading_day_stocks() -> list:
                 for c in df[code_col].tolist():
                     c_str = str(c).strip()
                     if c_str and len(c_str) == 6 and c_str.isdigit():
-                        # 只允许主板(60, 00)和创业板(30)
+                        # 过滤非主板、非创业板股票
                         if c_str.startswith(('60', '00', '30')):
                             stock_list.append(c_str)
                 
-                logger.info(f"✅ 成功提取并清洗 A 股主板/创业板【{target_date}】真实涨停个股共 {len(stock_list)} 只！")
+                logger.info(f"✅ 成功清洗并提取 A 股真实涨停个股共 {len(stock_list)} 只！")
                 return stock_list
 
-        logger.warning(f"⚠️ 接口响应成功，但【{target_date}】并未返回任何符合板块要求的涨停股票。")
+        logger.warning(f"⚠️ 接口响应成功，但【{target_date}】并未返回任何符合条件的股票。")
         return []
             
     except Exception as e:
@@ -282,7 +276,6 @@ def _compute_trading_day_filter(
     force_run = getattr(args, 'force_run', False)
     if force_run or not getattr(config, 'trading_day_check_enabled', True):
         return (stock_codes, None, False)
-        
     try:
         from src.core.trading_calendar import (
             get_market_for_stock, get_open_markets_today, compute_effective_region
@@ -293,7 +286,6 @@ def _compute_trading_day_filter(
             mkt = get_market_for_stock(code)
             if mkt in open_markets or mkt is None:
                 filtered_codes.append(code)
-                
         if config.market_review_enabled and not getattr(args, 'no_market_review', False):
             effective_region = compute_effective_region(
                 getattr(config, 'market_review_region', 'cn') or 'cn', open_markets
@@ -303,7 +295,7 @@ def _compute_trading_day_filter(
         should_skip_all = (not filtered_codes) and (effective_region or '') == ''
         return (filtered_codes, effective_region, should_skip_all)
     except Exception as e:
-        logger.warning(f"⚠️ 交易日历拦截模块网络波动，已自动切换为全面放行模式: {e}")
+        logger.warning(f"⚠️ 交易日历接口超时或网络受限，自动切换为安全放行模式: {e}")
         return (stock_codes, "cn", False)
 
 def _run_market_review_with_shared_lock(
@@ -352,7 +344,7 @@ def run_full_analysis(
                 effective_codes = [c for c in config.stock_list if "ZTPOOL" not in str(c).upper()]
         else:
             effective_codes = [c for c in config.stock_list if "ZTPOOL" not in str(c).upper()]
-            logger.info(f"📌 当前时段无可用动态涨停池，自动降级分析默认自选股（共 {len(effective_codes)} 只）")
+            logger.info(f"📌 当前时段无动态涨停池，自动降级分析默认自选股（共 {len(effective_codes)} 只）")
         # ====================================================================
 
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
@@ -378,7 +370,7 @@ def run_full_analysis(
             save_context_snapshot = False
         query_id = uuid.uuid4().hex
         
-        # 🛡️ 优化点 3：降低并发度为 2。线程太多更容易触发国内财经网站的防海外抓取高频屏蔽锁。
+        # 将并发控制在 2，防止高频触发国内防抓取节点拉黑
         workers = args.workers if args.workers is not None else 2
         
         pipeline = StockAnalysisPipeline(
