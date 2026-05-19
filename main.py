@@ -6,6 +6,12 @@
 # 3. 多封邮件轰炸
 # 4. 汇总邮件缺失
 # =====================================================================
+import os
+import sys
+import argparse
+
+from typing import Optional, List
+from src.config import Config
 
 def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Optional[List[str]] = None):
 
