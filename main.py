@@ -3,7 +3,7 @@
 ===================================
 A股自选股智能分析系统 - 主调度程序
 ===================================
-【稳定终版】自动涨停抓取 + 北京时间校准 + 邮件强制修复
+【稳定终版】自动涨停抓取 + 北京时间校准 + 邮件强制发送与报错追踪修复
 """
 from __future__ import annotations
 
@@ -51,8 +51,7 @@ from datetime import datetime, timezone, timedelta
 from dotenv import dotenv_values
 
 # ==============================================
-# ✅ ✅ ✅ 【邮件终极修复】自动兼容单数/复数变量
-# 你 GitHub 里的 EMAIL_RECEIVER 自动生效
+# ✅ 邮件终极修复：自动兼容单数/复数变量
 # ==============================================
 if os.getenv("EMAIL_RECEIVER") and not os.getenv("EMAIL_RECEIVERS"):
     os.environ["EMAIL_RECEIVERS"] = os.getenv("EMAIL_RECEIVER")
@@ -83,7 +82,7 @@ def get_beijing_time() -> datetime:
     tz_beijing = timezone(timedelta(hours=8))
     return datetime.now(timezone.utc).astimezone(tz_beijing)
 
-# ====================== 🎯 核心：自动获取涨停股 ======================
+# ====================== 🎯 自动获取涨停股 ======================
 def get_last_trading_day_stocks() -> list:
     global _HAS_REAL_DYNAMIC_DATA, _TARGET_DATE_STR
     try:
@@ -128,7 +127,7 @@ def get_last_trading_day_stocks() -> list:
         logger.error(f"❌ 涨停数据获取失败：{e}")
         return []
 
-# ====================== 以下是你原来能正常发邮件的完整代码 ======================
+# ====================== 环境加载基础逻辑 ======================
 def _get_active_env_path() -> Path:
     env_file = os.getenv("ENV_FILE")
     if env_file:
@@ -265,9 +264,18 @@ def _run_market_review_with_shared_lock(config: Config, run_market_review_func: 
     finally:
         release_market_review_lock(lock_token)
 
+# =====================================================================
+# 📧 🔥 【核心调度核心修复】：非交易日不中断 + 最外层强制邮件舱 + 异常必报红
+# =====================================================================
 def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Optional[List[str]] = None):
     from src.core.market_review import run_market_review
     from src.core.pipeline import StockAnalysisPipeline
+
+    global _HAS_REAL_DYNAMIC_DATA, _TARGET_DATE_STR
+    pipeline = None
+    results = []
+    market_report = ""
+    skip_reason = ""
 
     try:
         if stock_codes is None:
@@ -291,41 +299,72 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
             effective_codes = [c for c in config.stock_list if str(c).startswith(('60', '00', '30'))][:30]
 
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(config, args, effective_codes)
-        if should_skip:
-            logger.info("今日非交易日，跳过")
-            return
-        stock_codes = filtered_codes
-
+        
+        # 提前初始化流水线实体，确保下方哪怕休市跳过了，也能用它的 notifier 正常发送邮件
         if getattr(args, 'single_notify', False):
             config.single_stock_notify = True
-
-        merge_notification = getattr(config, 'merge_email_notification', False) and config.market_review_enabled and not getattr(args, 'no_market_review', False) and not config.single_stock_notify
-        save_context_snapshot = None
-        if getattr(args, 'no_context_snapshot', False):
-            save_context_snapshot = False
+        save_context_snapshot = False if getattr(args, 'no_context_snapshot', False) else None
         query_id = uuid.uuid4().hex
         workers = args.workers if args.workers is not None else 2
+        
         pipeline = StockAnalysisPipeline(config=config, max_workers=workers, query_id=query_id, query_source="cli", save_context_snapshot=save_context_snapshot)
-        results = pipeline.run(stock_codes=stock_codes, dry_run=args.dry_run, send_notification=not args.no_notify, merge_notification=merge_notification)
 
-        market_report = ""
-        if config.market_review_enabled and not args.no_market_review and effective_region != '':
-            review_result = _run_market_review_with_shared_lock(config, run_market_review, notifier=pipeline.notifier, analyzer=pipeline.analyzer, search_service=pipeline.search_service, send_notification=not args.no_notify, merge_notification=merge_notification, override_region=effective_region)
-            if review_result:
-                market_report = review_result
+        # 🚨 修复：非交易日不要直接 return 退出！放行向下，走强制发信总舱
+        if should_skip:
+            skip_reason = f"今日判断为非交易日（休市），系统自动跳过核心量化推演。数据目标日：{_TARGET_DATE_STR}"
+            logger.info(skip_reason)
+        else:
+            stock_codes = filtered_codes
+            merge_notification = getattr(config, 'merge_email_notification', False) and config.market_review_enabled and not getattr(args, 'no_market_review', False) and not config.single_stock_notify
+            
+            # 运行个股分析
+            try:
+                results = pipeline.run(stock_codes=stock_codes, dry_run=args.dry_run, send_notification=not args.no_notify, merge_notification=merge_notification)
+            except Exception as pipeline_err:
+                logger.error(f"⚠️ 个股流水线发生异常（可能触发了网络硬超时）: {pipeline_err}")
 
-        if merge_notification and (results or market_report) and not args.no_notify:
+            # 运行大盘复盘
+            if config.market_review_enabled and not args.no_market_review and effective_region != '':
+                try:
+                    review_result = _run_market_review_with_shared_lock(config, run_market_review, notifier=pipeline.notifier, analyzer=pipeline.analyzer, search_service=pipeline.search_service, send_notification=not args.no_notify, merge_notification=merge_notification, override_region=effective_region)
+                    if review_result:
+                        market_report = review_result
+                except Exception as review_err:
+                    logger.error(f"⚠️ 大盘复盘分析发生异常/超时: {review_err}")
+
+        # ====================================================
+        # 📧 强制合并发送舱：挪到最外层，剥离所有 if 条件限制
+        # ====================================================
+        if not args.no_notify and pipeline and pipeline.notifier and pipeline.notifier.is_available():
             parts = []
+            now_bj = get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')
+            parts.append(f"⏱️ **系统运行快报**：流水线于北京时间 `[{now_bj}]` 顺利收尾。")
+            
+            if skip_reason:
+                parts.append(f"ℹ️ **状态提示**：{skip_reason}")
+            elif not _HAS_REAL_DYNAMIC_DATA:
+                parts.append(f"⚠️ **数据提示**：未获取到当前时段的东财实时涨停池，已为您转向分析默认的自选标的。")
+            
             if market_report:
                 parts.append(f"# 📈 大盘复盘\n\n{market_report}")
             if results:
                 dashboard_content = pipeline.notifier.generate_aggregate_report(results, getattr(config, 'report_type', 'simple'))
-                parts.append(f"# 🚀 个股分析报告\n\n{dashboard_content}")
-            if parts:
-                combined_content = "\n\n---\n\n".join(parts)
-                if pipeline.notifier.is_available():
-                    pipeline.notifier.send(combined_content, email_send_to_all=True, route_type="report")
+                parts.append(f"# 🚀 个股推演分析报告\n\n{dashboard_content}")
+                
+            # 针对空跑或者节假日的兜底提示，绝不发送完全空白的邮件
+            if len(parts) <= 2 and not results and not market_report:
+                parts.append(f"# 📌 运行状态提示\n\n当前时段无需推演的个股或大盘报告，流水线安全结束。目标日期: {_TARGET_DATE_STR}")
+                
+            combined_content = "\n\n---\n\n".join(parts)
+            logger.info("📧 正在派发强制汇总邮件...")
+            try:
+                pipeline.notifier.send(combined_content, email_send_to_all=True, route_type="report")
+                logger.info("✅ 邮件已成功移交 SMTP 服务器。")
+            except Exception as mail_err:
+                logger.error(f"❌ SMTP 邮件投递严重失败: {mail_err}")
+                raise mail_err  # 🌟 核心：邮件发失败时主动抛出错误，让 GitHub Actions 报红叉，不再假成功！
 
+        # 打印控制台摘要
         if results:
             logger.info("\n===== 分析结果摘要 =====")
             for r in sorted(results, key=lambda x: getattr(x, 'sentiment_score', 60), reverse=True):
@@ -334,6 +373,7 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
                 advice = getattr(r, 'operation_advice', '观望')
                 logger.info(f"{emoji} {r.name}({r.code}): {advice} | 评分 {score}")
 
+        # 同步飞书文档逻辑
         try:
             from src.feishu_doc import FeishuDocManager
             feishu_doc = FeishuDocManager()
@@ -355,6 +395,7 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
 
     except Exception as e:
         logger.exception(f"执行失败：{e}")
+        raise e  # 🌟 让 GitHub Actions 框架捕获到真实崩溃，拒绝假绿勾！
 
 def main() -> int:
     args = parse_arguments()
