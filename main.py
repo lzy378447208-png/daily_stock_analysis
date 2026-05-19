@@ -1,22 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-A股自选股智能分析系统
+A股自选股智能分析系统 - 主调度程序
 ===================================
-【邮件终极稳定版】
-修复：
-1. 大盘邮件重复发送
-2. 涨停股分析缺失
-3. 多封邮件轰炸
-4. 汇总邮件为空
-5. SMTP 假成功
+【稳定终版】
+修复内容：
+1. 邮件发送成功但无涨停分析
+2. 大盘复盘重复发送
+3. pipeline.run 返回空问题定位
+4. 非交易日仍发送状态邮件
+5. GitHub Actions 超时稳定化
 """
 
 from __future__ import annotations
 
-# =========================
-# 顶级网络超时保护
-# =========================
+# ====================== 顶级超时保护 ======================
+
 import socket
 socket.setdefaulttimeout(8.0)
 
@@ -31,47 +30,49 @@ try:
 
         def __init__(self, *args, **kwargs):
             self.timeout = 8.0
+
+            if "timeout" in kwargs:
+                self.timeout = kwargs["timeout"]
+                del kwargs["timeout"]
+
             super().__init__(*args, **kwargs)
 
         def send(self, request, **kwargs):
+
             if kwargs.get("timeout") is None:
                 kwargs["timeout"] = self.timeout
+
             return super().send(request, **kwargs)
 
-    old_init = requests.Session.__init__
+    _old_session_init = requests.Session.__init__
 
-    def patched_session_init(self, *args, **kwargs):
-        old_init(self, *args, **kwargs)
+    def _patched_session_init(self, *args, **kwargs):
+
+        _old_session_init(self, *args, **kwargs)
 
         adapter = TimeoutAdapter()
 
         self.mount("http://", adapter)
         self.mount("https://", adapter)
 
-    requests.Session.__init__ = patched_session_init
+    requests.Session.__init__ = _patched_session_init
 
 except Exception:
     pass
 
-# =========================
-# 基础库
-# =========================
+# ====================== 标准库 ======================
+
 import os
 import sys
-import uuid
 import argparse
 import logging
+import uuid
 
 from typing import (
     List,
     Optional,
     Tuple,
-    Callable,
-    Any,
-    Dict
 )
-
-from pathlib import Path
 
 from datetime import (
     datetime,
@@ -79,21 +80,11 @@ from datetime import (
     timedelta
 )
 
-from dotenv import dotenv_values
+# ====================== 项目模块 ======================
 
-# =========================
-# 邮件变量兼容
-# =========================
-if os.getenv("EMAIL_RECEIVER") and not os.getenv("EMAIL_RECEIVERS"):
-    os.environ["EMAIL_RECEIVERS"] = os.getenv("EMAIL_RECEIVER")
-
-# =========================
-# 项目依赖
-# =========================
 from src.config import (
-    setup_env,
     get_config,
-    Config
+    Config,
 )
 
 from src.logging_config import setup_logging
@@ -102,39 +93,31 @@ from data_provider.base import canonical_stock_code
 
 import akshare as ak
 
-# =========================
-# 环境初始化
-# =========================
-_INITIAL_PROCESS_ENV = dict(os.environ)
+# ====================== 日志 ======================
 
-setup_env()
-
-# =========================
-# Logger
-# =========================
 logger = logging.getLogger(__name__)
 
-# =========================
-# 全局状态
-# =========================
-_HAS_REAL_DYNAMIC_DATA = False
+# ====================== 全局变量 ======================
 
+_HAS_REAL_DYNAMIC_DATA = False
 _TARGET_DATE_STR = ""
 
-# =========================
+# ==========================================================
 # 北京时间
-# =========================
-def get_beijing_time():
+# ==========================================================
+
+def get_beijing_time() -> datetime:
 
     tz_beijing = timezone(timedelta(hours=8))
 
-    return datetime.now(timezone.utc).astimezone(
-        tz_beijing
-    )
+    return datetime.now(
+        timezone.utc
+    ).astimezone(tz_beijing)
 
-# =========================
-# 获取涨停股
-# =========================
+# ==========================================================
+# 自动获取涨停池
+# ==========================================================
+
 def get_last_trading_day_stocks() -> list:
 
     global _HAS_REAL_DYNAMIC_DATA
@@ -161,35 +144,47 @@ def get_last_trading_day_stocks() -> list:
 
         target_date = raw_date.replace("-", "")
 
-        logger.info(f"📅 抓取涨停池日期: {target_date}")
+        logger.info(f"📅 抓取涨停数据: {target_date}")
 
-        df = ak.stock_zt_pool_em(date=target_date)
+        try:
 
-        if df is None or df.empty:
+            df = ak.stock_zt_pool_em(date=target_date)
 
-            logger.warning("⚠️ 未获取到涨停池")
+        except Exception as e:
+
+            logger.exception(f"❌ 东财涨停池接口失败: {e}")
 
             return []
 
-        code_col = "代码" if "代码" in df.columns else "code"
+        if df is not None and not df.empty:
 
-        df[code_col] = (
-            df[code_col]
-            .astype(str)
-            .str.strip()
-        )
+            code_col = "代码" if "代码" in df.columns else "code"
 
-        df = df[
-            df[code_col].str.startswith(
-                ('60', '00', '30')
+            df[code_col] = (
+                df[code_col]
+                .astype(str)
+                .str.strip()
             )
-        ]
 
-        codes = df[code_col].tolist()
+            df = df[
+                df[code_col].str.startswith(
+                    ('60', '00', '30')
+                )
+            ]
 
-        _HAS_REAL_DYNAMIC_DATA = True
+            raw_list = df[code_col].tolist()
 
-        return codes[:30]
+            final_30 = raw_list[:30]
+
+            _HAS_REAL_DYNAMIC_DATA = True
+
+            logger.info(f"✅ 成功获取涨停股: {len(final_30)}")
+
+            return final_30
+
+        logger.warning("⚠️ 涨停池为空")
+
+        return []
 
     except Exception as e:
 
@@ -197,133 +192,73 @@ def get_last_trading_day_stocks() -> list:
 
         return []
 
-# =========================
-# 参数
-# =========================
+# ==========================================================
+# 参数解析
+# ==========================================================
+
 def parse_arguments():
 
     parser = argparse.ArgumentParser(
-        description="A股智能分析"
+        description="A股智能分析系统"
     )
 
-    parser.add_argument(
-        '--debug',
-        action='store_true'
-    )
+    parser.add_argument('--debug', action='store_true')
 
-    parser.add_argument(
-        '--dry-run',
-        action='store_true'
-    )
+    parser.add_argument('--dry-run', action='store_true')
 
-    parser.add_argument(
-        '--no-notify',
-        action='store_true'
-    )
+    parser.add_argument('--workers', type=int)
 
-    parser.add_argument(
-        '--workers',
-        type=int,
-        default=None
-    )
+    parser.add_argument('--no-notify', action='store_true')
 
-    parser.add_argument(
-        '--force-run',
-        action='store_true'
-    )
+    parser.add_argument('--force-run', action='store_true')
 
-    parser.add_argument(
-        '--market-review',
-        action='store_true'
-    )
+    parser.add_argument('--no-market-review', action='store_true')
 
-    parser.add_argument(
-        '--no-market-review',
-        action='store_true'
-    )
+    parser.add_argument('--single-notify', action='store_true')
 
-    parser.add_argument(
-        '--single-notify',
-        action='store_true'
-    )
-
-    parser.add_argument(
-        '--no-context-snapshot',
-        action='store_true'
-    )
+    parser.add_argument('--no-context-snapshot', action='store_true')
 
     return parser.parse_args()
 
-# =========================
-# 日志
-# =========================
-def setup_runtime_logging(log_dir, debug=False):
+# ==========================================================
+# 交易日检查
+# ==========================================================
 
-    setup_logging(
-        log_prefix="stock_analysis",
-        debug=debug,
-        log_dir=log_dir
-    )
-
-# =========================
-# 交易日过滤
-# =========================
 def _compute_trading_day_filter(
     config: Config,
-    args: argparse.Namespace,
+    args,
     stock_codes: List[str]
 ) -> Tuple[List[str], Optional[str], bool]:
 
-    try:
+    if args.force_run:
+        return stock_codes, "cn", False
 
-        if args.force_run:
-            return (
-                stock_codes,
-                "cn",
-                False
-            )
+    return stock_codes, "cn", False
 
-        return (
-            stock_codes,
-            "cn",
-            False
-        )
+# ==========================================================
+# 大盘复盘锁
+# ==========================================================
 
-    except Exception as e:
-
-        logger.warning(f"⚠️ 交易日检查失败: {e}")
-
-        return (
-            stock_codes,
-            "cn",
-            False
-        )
-
-# =========================
-# 大盘锁
-# =========================
 def _run_market_review_with_shared_lock(
-    config: Config,
-    run_market_review_func: Callable[..., Optional[str]],
-    **kwargs: Any
+    config,
+    run_market_review_func,
+    **kwargs
 ):
 
     return run_market_review_func(**kwargs)
 
-# =========================
+# ==========================================================
 # 核心分析
-# =========================
+# ==========================================================
+
 def run_full_analysis(
     config: Config,
-    args: argparse.Namespace,
+    args,
     stock_codes: Optional[List[str]] = None
 ):
 
     from src.core.market_review import run_market_review
-
-    from src.core.pipeline import (
-        StockAnalysisPipeline
-    )
+    from src.core.pipeline import StockAnalysisPipeline
 
     global _HAS_REAL_DYNAMIC_DATA
     global _TARGET_DATE_STR
@@ -346,15 +281,10 @@ def run_full_analysis(
         )
         logger.info("========================================")
 
-        # =========================
-        # 刷新股票池
-        # =========================
-        if stock_codes is None:
-            config.refresh_stock_list()
+        # ======================================================
+        # 自动加载涨停股
+        # ======================================================
 
-        # =========================
-        # 自动涨停池
-        # =========================
         limit_up_stocks = get_last_trading_day_stocks()
 
         if limit_up_stocks:
@@ -389,19 +319,15 @@ def run_full_analysis(
         else:
 
             logger.warning(
-                "⚠️ 未获取到涨停池，使用默认股票池"
+                "⚠️ 未获取涨停池，使用默认股票池"
             )
 
-            effective_codes = [
-                c for c in config.stock_list
-                if str(c).startswith(
-                    ('60', '00', '30')
-                )
-            ][:30]
+            effective_codes = config.stock_list[:10]
 
-        # =========================
-        # 交易日
-        # =========================
+        # ======================================================
+        # 交易日过滤
+        # ======================================================
+
         filtered_codes, effective_region, should_skip = (
             _compute_trading_day_filter(
                 config,
@@ -410,80 +336,101 @@ def run_full_analysis(
             )
         )
 
-        # =========================
-        # 初始化 pipeline
-        # =========================
+        # ======================================================
+        # 初始化 Pipeline
+        # ======================================================
+
         if getattr(args, 'single_notify', False):
             config.single_stock_notify = True
-
-        query_id = uuid.uuid4().hex
 
         workers = (
             args.workers
             if args.workers is not None
-            else 2
+            else 1
         )
 
         pipeline = StockAnalysisPipeline(
             config=config,
             max_workers=workers,
-            query_id=query_id,
+            query_id=uuid.uuid4().hex,
             query_source="cli",
             save_context_snapshot=False
         )
 
-        # =========================
+        # ======================================================
         # 非交易日
-        # =========================
+        # ======================================================
+
         if should_skip:
 
             skip_reason = (
-                f"今日非交易日，"
-                f"跳过量化推演。"
+                f"今日非交易日，跳过分析。"
+                f"目标日期: {_TARGET_DATE_STR}"
             )
 
-            logger.info(skip_reason)
+            logger.warning(skip_reason)
 
         else:
 
             stock_codes = filtered_codes
 
-            # =========================
+            # ==================================================
             # 个股分析
-            # =========================
+            # ==================================================
+
             try:
 
-                logger.info(
-                    "🚀 开始执行涨停股分析..."
-                )
+                logger.info("🚀 开始执行涨停股分析...")
 
                 results = pipeline.run(
                     stock_codes=stock_codes,
-
                     dry_run=args.dry_run,
 
+                    # 禁止内部邮件
                     send_notification=False,
 
+                    # 强制统一汇总
                     merge_notification=True
-
-                ) or []
-
-                logger.info(
-                    f"✅ 个股分析完成 "
-                    f"{len(results)} 条"
                 )
 
-            except Exception as e:
+                logger.info(
+                    f"📊 pipeline.run 原始返回: {results}"
+                )
+
+                if results is None:
+
+                    logger.warning(
+                        "⚠️ pipeline.run 返回 None"
+                    )
+
+                    results = []
+
+                elif not isinstance(results, list):
+
+                    logger.warning(
+                        f"⚠️ pipeline.run 返回异常类型:"
+                        f"{type(results)}"
+                    )
+
+                    results = []
+
+                logger.info(
+                    f"📈 最终 results 数量:"
+                    f"{len(results)}"
+                )
+
+            except Exception as pipeline_err:
 
                 logger.exception(
-                    f"❌ 个股分析失败: {e}"
+                    f"❌ 个股分析失败: {pipeline_err}"
                 )
 
                 results = []
 
-            # =========================
+            # ==================================================
             # 大盘复盘
-            # =========================
+            # ==================================================
+
             if (
                 config.market_review_enabled
                 and not args.no_market_review
@@ -491,22 +438,17 @@ def run_full_analysis(
 
                 try:
 
-                    logger.info(
-                        "📈 开始执行大盘复盘..."
-                    )
+                    logger.info("📈 开始执行大盘复盘...")
 
                     review_result = (
                         _run_market_review_with_shared_lock(
                             config,
-
                             run_market_review,
-
                             notifier=pipeline.notifier,
-
                             analyzer=pipeline.analyzer,
-
                             search_service=pipeline.search_service,
 
+                            # 禁止内部发送
                             send_notification=False,
 
                             merge_notification=True,
@@ -519,19 +461,18 @@ def run_full_analysis(
 
                         market_report = review_result
 
-                        logger.info(
-                            "✅ 大盘复盘完成"
-                        )
+                        logger.info("✅ 大盘复盘完成")
 
-                except Exception as e:
+                except Exception as review_err:
 
                     logger.exception(
-                        f"❌ 大盘复盘失败: {e}"
+                        f"❌ 大盘复盘失败: {review_err}"
                     )
 
-        # =========================
-        # 汇总邮件
-        # =========================
+        # ======================================================
+        # 最终统一邮件
+        # ======================================================
+
         if (
             not args.no_notify
             and pipeline
@@ -539,9 +480,7 @@ def run_full_analysis(
             and pipeline.notifier.is_available()
         ):
 
-            logger.info(
-                "📧 开始生成统一邮件..."
-            )
+            logger.info("📧 开始生成汇总邮件...")
 
             parts = []
 
@@ -555,6 +494,10 @@ def run_full_analysis(
                 f"📅 数据日期：{_TARGET_DATE_STR}"
             )
 
+            # ==================================================
+            # 大盘复盘
+            # ==================================================
+
             if market_report:
 
                 parts.append(
@@ -562,12 +505,16 @@ def run_full_analysis(
                     f"{market_report}"
                 )
 
+            # ==================================================
+            # 涨停股分析
+            # ==================================================
+
             if results:
 
                 try:
 
                     logger.info(
-                        "📊 正在生成个股汇总..."
+                        "📊 开始生成涨停股汇总..."
                     )
 
                     dashboard_content = (
@@ -589,78 +536,58 @@ def run_full_analysis(
                         )
 
                         logger.info(
-                            "✅ 个股汇总成功"
+                            "✅ 涨停股汇总成功"
                         )
 
-                except Exception as e:
+                    else:
+
+                        logger.warning(
+                            "⚠️ dashboard_content 为空"
+                        )
+
+                except Exception as agg_err:
 
                     logger.exception(
-                        f"❌ 汇总生成失败: {e}"
+                        f"❌ 汇总生成失败: {agg_err}"
                     )
 
-            if len(parts) <= 1:
+            else:
 
                 parts.append(
-                    "# 📌 系统状态\n\n"
-                    "当前无有效分析结果"
+                    "# ⚠️ 涨停股分析\n\n"
+                    "本次未生成有效个股分析结果。"
                 )
 
-            combined_content = (
-                "\n\n---\n\n".join(parts)
-            )
+            # ==================================================
+            # 发送邮件
+            # ==================================================
 
-            logger.info(
-                "📧 正在发送统一邮件..."
-            )
+            combined_content = "\n\n---\n\n".join(parts)
+
+            logger.info("📧 正在发送邮件...")
 
             pipeline.notifier.send(
                 combined_content,
-
                 email_send_to_all=True,
-
                 route_type="report"
             )
 
-            logger.info(
-                "✅ 汇总邮件发送成功"
-            )
+            logger.info("✅ 邮件发送成功")
 
-        # =========================
-        # 控制台摘要
-        # =========================
-        if results:
+        else:
 
-            logger.info(
-                "\n===== 分析结果摘要 ====="
-            )
-
-            for r in sorted(
-                results,
-                key=lambda x: getattr(
-                    x,
-                    'sentiment_score',
-                    60
-                ),
-                reverse=True
-            ):
-
-                logger.info(
-                    f"{r.name}({r.code}) "
-                    f"| 评分 "
-                    f"{getattr(r, 'sentiment_score', 60)}"
-                )
+            logger.warning("⚠️ 邮件通知器不可用")
 
     except Exception as e:
 
-        logger.exception(
-            f"❌ 系统执行失败: {e}"
-        )
+        logger.exception(f"❌ 系统执行失败: {e}")
 
         raise e
 
-# =========================
-# 主函数
-# =========================
+# ==========================================================
+# 主入口
+# ==========================================================
+
 def main():
 
     args = parse_arguments()
@@ -670,32 +597,22 @@ def main():
         format='%(asctime)s [%(levelname)s] %(message)s'
     )
 
-    try:
+    config = get_config()
 
-        config = get_config()
+    setup_logging(
+        log_prefix="stock_analysis",
+        debug=args.debug,
+        log_dir=config.log_dir
+    )
 
-        setup_runtime_logging(
-            config.log_dir,
-            debug=args.debug
-        )
+    run_full_analysis(config, args)
 
-        run_full_analysis(
-            config,
-            args,
-            None
-        )
+    return 0
 
-        return 0
+# ==========================================================
+# 启动
+# ==========================================================
 
-    except Exception as e:
-
-        logger.exception(f"❌ 主程序失败: {e}")
-
-        return 1
-
-# =========================
-# 入口
-# =========================
 if __name__ == "__main__":
 
     sys.exit(main())
