@@ -8,6 +8,7 @@
 # =====================================================================
 
 def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Optional[List[str]] = None):
+
     from src.core.market_review import run_market_review
     from src.core.pipeline import StockAnalysisPipeline
 
@@ -36,7 +37,9 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
             sanitized = []
 
             for c in limit_up_stocks:
+
                 try:
+
                     std = canonical_stock_code(str(c).strip())
 
                     if std and std.startswith(('60', '00', '30')):
@@ -75,7 +78,10 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
         if getattr(args, 'single_notify', False):
             config.single_stock_notify = True
 
-        save_context_snapshot = False if getattr(args, 'no_context_snapshot', False) else None
+        save_context_snapshot = (
+            False if getattr(args, 'no_context_snapshot', False)
+            else None
+        )
 
         query_id = uuid.uuid4().hex
 
@@ -107,38 +113,37 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
             stock_codes = filtered_codes
 
             # ======================================================
-            # 🚨 个股分析（禁止内部邮件发送）
+            # 🚨 个股分析（禁止内部邮件）
             # ======================================================
             try:
 
-                logger.info("🚀 开始执行涨停股智能分析...")
+                logger.info("🚀 开始执行涨停股分析...")
 
                 results = pipeline.run(
                     stock_codes=stock_codes,
 
                     dry_run=args.dry_run,
 
-                    # 🚨 核心修复：
-                    # 禁止 pipeline 内部发送邮件
+                    # 🚨 禁止内部邮件
                     send_notification=False,
 
-                    # 🚨 强制统一汇总
+                    # 🚨 强制合并
                     merge_notification=True
 
                 ) or []
 
-                logger.info(f"✅ 个股分析完成，共生成 {len(results)} 条结果")
+                logger.info(f"✅ 个股分析完成，共 {len(results)} 条")
 
             except Exception as pipeline_err:
 
                 logger.exception(
-                    f"⚠️ 个股分析流水线异常: {pipeline_err}"
+                    f"⚠️ 个股分析异常: {pipeline_err}"
                 )
 
                 results = []
 
             # ======================================================
-            # 🚨 大盘复盘（禁止内部邮件发送）
+            # 🚨 大盘复盘（禁止内部邮件）
             # ======================================================
             if (
                 config.market_review_enabled
@@ -148,7 +153,7 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
 
                 try:
 
-                    logger.info("📈 开始执行大盘复盘分析...")
+                    logger.info("📈 开始执行大盘复盘...")
 
                     review_result = _run_market_review_with_shared_lock(
                         config,
@@ -161,8 +166,7 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
 
                         search_service=pipeline.search_service,
 
-                        # 🚨 核心修复：
-                        # 禁止内部发送
+                        # 🚨 禁止内部发送
                         send_notification=False,
 
                         # 🚨 强制统一汇总
@@ -172,6 +176,7 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
                     )
 
                     if review_result:
+
                         market_report = review_result
 
                         logger.info("✅ 大盘复盘完成")
@@ -183,7 +188,7 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
                     )
 
         # ==========================================================
-        # 🚨 最终统一邮件发送（只发送一次）
+        # 🚨 最终统一邮件发送
         # ==========================================================
         if (
             not args.no_notify
@@ -192,15 +197,12 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
             and pipeline.notifier.is_available()
         ):
 
-            logger.info("📧 开始生成统一汇总邮件...")
+            logger.info("📧 开始生成统一邮件...")
 
             parts = []
 
             now_bj = get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')
 
-            # ======================================================
-            # 系统状态
-            # ======================================================
             parts.append(
                 f"# 🤖 A股智能分析日报\n\n"
                 f"⏰ 生成时间：{now_bj}\n\n"
@@ -213,18 +215,18 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
             if skip_reason:
 
                 parts.append(
-                    f"# ℹ️ 运行状态\n\n"
+                    f"# ℹ️ 系统状态\n\n"
                     f"{skip_reason}"
                 )
 
             # ======================================================
-            # 涨停数据状态
+            # 数据状态提示
             # ======================================================
             elif not _HAS_REAL_DYNAMIC_DATA:
 
                 parts.append(
                     "# ⚠️ 数据提示\n\n"
-                    "未获取到实时涨停池，系统已自动切换至默认股票池分析。"
+                    "未获取到实时涨停池，已自动切换默认股票池分析。"
                 )
 
             # ======================================================
@@ -238,7 +240,7 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
                 )
 
             # ======================================================
-            # 个股分析（核心修复）
+            # 个股分析（核心）
             # ======================================================
             if results:
 
@@ -260,11 +262,11 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
                             f"{dashboard_content}"
                         )
 
-                        logger.info("✅ 个股汇总报告生成成功")
+                        logger.info("✅ 个股汇总生成成功")
 
                     else:
 
-                        logger.warning("⚠️ generate_aggregate_report 返回为空")
+                        logger.warning("⚠️ 个股汇总为空")
 
                 except Exception as agg_err:
 
@@ -273,29 +275,27 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
                     )
 
             # ======================================================
-            # 空报告兜底
+            # 空内容兜底
             # ======================================================
             if len(parts) <= 2:
 
                 parts.append(
                     "# 📌 系统状态\n\n"
-                    "当前无可推演数据，分析系统已安全结束运行。"
+                    "当前无有效分析数据，系统安全结束运行。"
                 )
 
             # ======================================================
-            # 合并最终邮件
+            # 合并邮件
             # ======================================================
             combined_content = "\n\n---\n\n".join(parts)
 
-            logger.info("📧 正在发送统一汇总邮件...")
+            logger.info("📧 正在发送统一邮件...")
 
             try:
 
                 pipeline.notifier.send(
                     combined_content,
-
                     email_send_to_all=True,
-
                     route_type="report"
                 )
 
@@ -311,7 +311,7 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
 
         else:
 
-            logger.warning("⚠️ 邮件通知器不可用，跳过发送")
+            logger.warning("⚠️ 邮件通知器不可用")
 
         # ==========================================================
         # 控制台摘要
@@ -345,65 +345,6 @@ def run_full_analysis(config: Config, args: argparse.Namespace, stock_codes: Opt
                     f"| {advice} "
                     f"| 评分 {score}"
                 )
-
-        # ==========================================================
-        # 飞书文档同步
-        # ==========================================================
-        try:
-
-            from src.feishu_doc import FeishuDocManager
-
-            feishu_doc = FeishuDocManager()
-
-            if feishu_doc.is_configured() and (results or market_report):
-
-                tz_cn = timezone(timedelta(hours=8))
-
-                now = datetime.now(tz_cn)
-
-                doc_title = (
-                    f"{now.strftime('%Y-%m-%d')} "
-                    f"A股量化复盘"
-                )
-
-                full_content = ""
-
-                if market_report:
-
-                    full_content += (
-                        f"# 📈 大盘复盘\n\n"
-                        f"{market_report}\n\n---\n\n"
-                    )
-
-                if results:
-
-                    dashboard_content = (
-                        pipeline.notifier.generate_aggregate_report(
-                            results,
-                            getattr(config, 'report_type', 'simple')
-                        )
-                    )
-
-                    full_content += (
-                        f"# 🚀 涨停股深度分析\n\n"
-                        f"{dashboard_content}"
-                    )
-
-                doc_url = feishu_doc.create_daily_doc(
-                    doc_title,
-                    full_content
-                )
-
-                if doc_url and not args.no_notify:
-
-                    pipeline.notifier.send(
-                        f"📄 飞书复盘文档已生成：\n\n{doc_url}",
-                        route_type="report"
-                    )
-
-        except Exception as e:
-
-            logger.exception(f"飞书文档生成失败：{e}")
 
     except Exception as e:
 
